@@ -1,0 +1,20 @@
+# ansible-playbook -i inventory.yml --vault-id default@/etc/ansible_pass_marinor deploy.yml --diff --extra-vars '{"tag": "v1.13.1"}'
+
+- name: Deploy
+  hosts: linode
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Update .env file
+      blockinfile:
+        path: /root/gui/.env
+        create: true
+        marker: "# {mark} ANSIBLE MANAGED BLOCK"
+        block: |
+          TAG={{ tag }}
+
+    - name: Run docker compose
+      shell: docker compose up -d
+      args:
+        chdir: /root/gui
