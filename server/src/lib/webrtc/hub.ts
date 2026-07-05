@@ -23,8 +23,22 @@ import type { WebSocket } from "ws";
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 const PLI_INTERVAL_MS = 2000;
 
+// Behind Docker/NAT, werift only sees container-internal interfaces. Publish a
+// fixed UDP port range (must be mapped in compose + opened in the firewall) and
+// advertise the host's public IP so remote peers get a reachable candidate.
+// PUBLIC_IP: the server's public address (e.g. the Linode IP).
+// ICE_PORT_MIN/ICE_PORT_MAX: the published UDP range.
+const PUBLIC_IP = process.env.PUBLIC_IP;
+const ICE_PORT_MIN = Number(process.env.ICE_PORT_MIN ?? 50000);
+const ICE_PORT_MAX = Number(process.env.ICE_PORT_MAX ?? 50019);
+
 function createPeerConnection(): RTCPeerConnection {
-  return new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  return new RTCPeerConnection({
+    iceServers: ICE_SERVERS,
+    iceUseIpv4: true,
+    icePortRange: [ICE_PORT_MIN, ICE_PORT_MAX],
+    iceAdditionalHostAddresses: PUBLIC_IP ? [PUBLIC_IP] : undefined,
+  });
 }
 
 type SignalMessage =
