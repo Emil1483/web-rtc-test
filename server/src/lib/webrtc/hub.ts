@@ -71,12 +71,22 @@ interface ViewerSession {
   videoSender: RTCRtpSender;
 }
 
+// Realtime telemetry (100 Hz): drop old data rather than queue it. Unreliable +
+// unordered so a slow/lossy viewer never builds a growing SCTP send buffer.
+const TELEMETRY_DC_OPTS = { ordered: false, maxRetransmits: 0 };
+
 class Hub {
   private robotVideoTrack: MediaStreamTrack | null = null;
   private robotReceiver: RTCRtpReceiver | null = null;
   private robotChannel: RTCDataChannel | null = null;
+  private robotOnline = false;
   private pliTimer: ReturnType<typeof setInterval> | null = null;
   private viewers = new Set<ViewerSession>();
+
+  // For the /api/status endpoint.
+  get status() {
+    return { robot: this.robotOnline, viewers: this.viewers.size };
+  }
 
   private broadcastToViewers(text: string) {
     for (const viewer of this.viewers) {
@@ -86,6 +96,14 @@ class Hub {
         console.warn("[hub] failed to send to viewer:", err);
       }
     }
+  }
+
+  private setRobotOnline(online: boolean) {
+    if (this.robotOnline === online) return;
+    this.robotOnline = online;
+    this.broadcastToViewers(
+      JSON.stringify({ status: online ? "online" : "offline" }),
+    );
   }
 
   private requestKeyframe() {
@@ -124,8 +142,11 @@ class Hub {
       }
     });
 
-    const channel = pc.createDataChannel("telemetry");
+    const channel = pc.createDataChannel("telemetry", TELEMETRY_DC_OPTS);
     this.robotChannel = channel;
+    channel.stateChanged.subscribe((state) => {
+      if (state === "open") this.setRobotOnline(true);
+    });
     channel.onMessage.subscribe((data) =>
       this.broadcastToViewers(data.toString()),
     );
@@ -148,6 +169,11 @@ class Hub {
         clearInterval(this.pliTimer);
         this.pliTimer = null;
       }
+      // Stop feeding viewers a frozen last frame and mark the robot offline.
+      for (const viewer of this.viewers) {
+        void viewer.videoSender.replaceTrack(null).catch(() => {});
+      }
+      this.setRobotOnline(false);
       pc.close();
     });
   }
@@ -169,8 +195,16 @@ class Hub {
     };
     this.viewers.add(session);
 
-    const channel = pc.createDataChannel("telemetry");
+    const channel = pc.createDataChannel("telemetry", TELEMETRY_DC_OPTS);
     session.channel = channel;
+    channel.stateChanged.subscribe((state) => {
+      // Tell a freshly-connected viewer the current robot status.
+      if (state === "open") {
+        channel.send(
+          JSON.stringify({ status: this.robotOnline ? "online" : "offline" }),
+        );
+      }
+    });
     channel.onMessage.subscribe((data) => {
       // Viewer -> robot (command path). Robot may be absent; ignore then.
       this.robotChannel?.send(data.toString());

@@ -79,6 +79,7 @@ export default function Home() {
   const [state, setState] = useState<RTCPeerConnectionState>("new");
   const [values, setValues] = useState<number[]>([0, 0, 0, 0]);
   const [hz, setHz] = useState(0);
+  const [robotOnline, setRobotOnline] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const latestValues = useRef<number[]>([0, 0, 0, 0]);
@@ -97,8 +98,12 @@ export default function Home() {
       e.channel.onmessage = (ev) => {
         try {
           const data = JSON.parse(ev.data);
-          if (Array.isArray(data.v)) latestValues.current = data.v;
-          msgTimes.current.push(performance.now());
+          if (data.status) {
+            setRobotOnline(data.status === "online");
+          } else if (Array.isArray(data.v)) {
+            latestValues.current = data.v;
+            msgTimes.current.push(performance.now());
+          }
         } catch {
           /* ignore malformed */
         }
@@ -157,14 +162,35 @@ export default function Home() {
           <Chip label={`WebRTC: ${state}`} color={color} size="small" />
         </Box>
 
-        <Paper variant="outlined" sx={{ p: 1, bgcolor: "black" }}>
+        <Paper
+          variant="outlined"
+          sx={{ p: 1, bgcolor: "black", position: "relative" }}
+        >
           <video
             ref={videoRef}
             autoPlay
             muted
             playsInline
-            style={{ width: "100%", borderRadius: 4, display: "block" }}
+            style={{
+              width: "100%",
+              borderRadius: 4,
+              display: "block",
+              opacity: robotOnline ? 1 : 0.3,
+            }}
           />
+          {!robotOnline && (
+            <Box
+              sx={{
+                position: "absolute",
+                inset: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+              }}
+            >
+              <Chip label="Robot offline" color="error" />
+            </Box>
+          )}
         </Paper>
 
         <Paper variant="outlined" sx={{ p: 2 }}>
