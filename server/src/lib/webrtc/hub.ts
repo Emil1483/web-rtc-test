@@ -1,71 +1,185 @@
 // WebRTC hub — the server side of the SFU.
 //
-// Phase 1: accept a single robot peer over the signaling WebSocket, complete
-// the offer/answer handshake with werift, and echo whatever arrives on the
-// robot's data channel. Viewer fan-out (multiple browsers) lands in Phase 2.
+// The server (werift) is the OFFERER for every peer. werift interops with
+// aiortc/browsers reliably as the offerer; as the answerer it fails DTLS/BUNDLE
+// when a media m-line and a data channel are bundled together. So both the
+// robot and each viewer connect, receive our offer, and answer.
+//
+// Data flow:
+//   robot  --video track----> server --forward RTP--> each viewer
+//   robot  --telemetry DC---> server --rebroadcast--> each viewer DC
+// One received robot track is fanned out to every viewer's sender via
+// replaceTrack (the werift SFU pattern) — no transcoding.
 
 import { RTCPeerConnection } from "werift";
+import type {
+  MediaStreamTrack,
+  RTCDataChannel,
+  RTCRtpReceiver,
+  RTCRtpSender,
+} from "werift";
 import type { WebSocket } from "ws";
 
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
+const PLI_INTERVAL_MS = 2000;
 
-// Signaling messages exchanged over the WebSocket. werift/aiortc both embed
-// their gathered ICE candidates directly in the SDP (non-trickle), so a single
-// offer/answer round-trip is all we need — no separate candidate messages yet.
+function createPeerConnection(): RTCPeerConnection {
+  return new RTCPeerConnection({ iceServers: ICE_SERVERS });
+}
+
 type SignalMessage =
   | { type: "offer"; sdp: string }
   | { type: "answer"; sdp: string };
 
-function send(socket: WebSocket, message: SignalMessage) {
-  socket.send(JSON.stringify(message));
+function parseSignal(raw: unknown): SignalMessage | null {
+  try {
+    return JSON.parse(String(raw));
+  } catch {
+    console.warn("[hub] ignoring non-JSON signaling message");
+    return null;
+  }
 }
 
-// Handle one robot connection. The robot is the offerer (it owns the media),
-// so we wait for its offer, answer it, and wire up the data channel.
-export function handleRobot(socket: WebSocket) {
-  console.log("[hub] robot connected");
-  let pc: RTCPeerConnection | null = null;
+// werift embeds gathered ICE candidates in the SDP (non-trickle), so sending
+// localDescription after setLocalDescription is a complete offer.
+async function sendOffer(pc: RTCPeerConnection, socket: WebSocket) {
+  await pc.setLocalDescription(await pc.createOffer());
+  const local = pc.localDescription;
+  if (!local) {
+    console.error("[hub] no local description after createOffer");
+    return;
+  }
+  socket.send(JSON.stringify({ type: "offer", sdp: local.sdp }));
+}
 
-  socket.on("message", async (raw) => {
-    let message: SignalMessage;
-    try {
-      message = JSON.parse(raw.toString());
-    } catch {
-      console.warn("[hub] ignoring non-JSON signaling message");
-      return;
+interface ViewerSession {
+  channel: RTCDataChannel | null;
+  videoSender: RTCRtpSender;
+}
+
+class Hub {
+  private robotVideoTrack: MediaStreamTrack | null = null;
+  private robotReceiver: RTCRtpReceiver | null = null;
+  private robotChannel: RTCDataChannel | null = null;
+  private pliTimer: ReturnType<typeof setInterval> | null = null;
+  private viewers = new Set<ViewerSession>();
+
+  private broadcastToViewers(text: string) {
+    for (const viewer of this.viewers) {
+      try {
+        viewer.channel?.send(text);
+      } catch (err) {
+        console.warn("[hub] failed to send to viewer:", err);
+      }
     }
+  }
 
-    if (message.type !== "offer") return;
+  private requestKeyframe() {
+    if (this.robotReceiver && this.robotVideoTrack?.ssrc) {
+      this.robotReceiver.sendRtcpPLI(this.robotVideoTrack.ssrc);
+    }
+  }
 
-    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  // Point a viewer's sender at the robot track. One track, many senders.
+  private attachVideo(viewer: ViewerSession) {
+    if (this.robotVideoTrack) {
+      void viewer.videoSender.replaceTrack(this.robotVideoTrack);
+      this.requestKeyframe(); // new consumer needs a fresh keyframe
+    }
+  }
 
+  // Robot: server offers recvonly video + a data channel; robot answers,
+  // sending its video and its telemetry.
+  handleRobot(socket: WebSocket) {
+    console.log("[hub] robot connected");
+    const pc = createPeerConnection();
     pc.iceConnectionStateChange.subscribe((state) =>
       console.log("[hub] robot ICE state:", state),
     );
 
-    pc.onDataChannel.subscribe((channel) => {
-      console.log(`[hub] robot data channel open: ${channel.label}`);
-      channel.onMessage.subscribe((data) => {
-        const text = data.toString();
-        console.log("[hub] from robot:", text);
-        channel.send(`echo:${text}`); // Phase 1: prove the round-trip works.
-      });
+    const videoTransceiver = pc.addTransceiver("video", {
+      direction: "recvonly",
+    });
+    this.robotReceiver = videoTransceiver.receiver;
+    videoTransceiver.onTrack.subscribe((track) => {
+      console.log("[hub] robot video track received");
+      this.robotVideoTrack = track;
+      for (const viewer of this.viewers) this.attachVideo(viewer);
+      if (!this.pliTimer) {
+        this.pliTimer = setInterval(() => this.requestKeyframe(), PLI_INTERVAL_MS);
+      }
     });
 
-    await pc.setRemoteDescription({ type: "offer", sdp: message.sdp });
-    await pc.setLocalDescription(await pc.createAnswer());
+    const channel = pc.createDataChannel("telemetry");
+    this.robotChannel = channel;
+    channel.onMessage.subscribe((data) =>
+      this.broadcastToViewers(data.toString()),
+    );
 
-    const local = pc.localDescription;
-    if (!local) {
-      console.error("[hub] no local description after createAnswer");
-      return;
-    }
-    send(socket, { type: "answer", sdp: local.sdp });
-  });
+    void sendOffer(pc, socket);
 
-  socket.on("close", () => {
-    console.log("[hub] robot disconnected");
-    pc?.close();
-    pc = null;
-  });
+    socket.on("message", (raw) => {
+      const message = parseSignal(raw);
+      if (message?.type === "answer") {
+        void pc.setRemoteDescription({ type: "answer", sdp: message.sdp });
+      }
+    });
+
+    socket.on("close", () => {
+      console.log("[hub] robot disconnected");
+      this.robotChannel = null;
+      this.robotVideoTrack = null;
+      this.robotReceiver = null;
+      if (this.pliTimer) {
+        clearInterval(this.pliTimer);
+        this.pliTimer = null;
+      }
+      pc.close();
+    });
+  }
+
+  // Viewer: server offers sendonly video + a data channel; browser answers.
+  handleViewer(socket: WebSocket) {
+    console.log(`[hub] viewer connected (total: ${this.viewers.size + 1})`);
+    const pc = createPeerConnection();
+    pc.iceConnectionStateChange.subscribe((state) =>
+      console.log("[hub] viewer ICE state:", state),
+    );
+
+    const videoTransceiver = pc.addTransceiver("video", {
+      direction: "sendonly",
+    });
+    const session: ViewerSession = {
+      channel: null,
+      videoSender: videoTransceiver.sender,
+    };
+    this.viewers.add(session);
+
+    const channel = pc.createDataChannel("telemetry");
+    session.channel = channel;
+    channel.onMessage.subscribe((data) => {
+      // Viewer -> robot (command path). Robot may be absent; ignore then.
+      this.robotChannel?.send(data.toString());
+    });
+
+    this.attachVideo(session); // no-op until the robot track exists
+
+    void sendOffer(pc, socket);
+
+    socket.on("message", (raw) => {
+      const message = parseSignal(raw);
+      if (message?.type === "answer") {
+        void pc.setRemoteDescription({ type: "answer", sdp: message.sdp });
+      }
+    });
+
+    socket.on("close", () => {
+      this.viewers.delete(session);
+      console.log(`[hub] viewer disconnected (remaining: ${this.viewers.size})`);
+      pc.close();
+    });
+  }
 }
+
+// Single shared hub across the process (module singleton).
+export const hub = new Hub();

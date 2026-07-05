@@ -1,7 +1,7 @@
 // WebRTC signaling endpoint (next-ws). Robot and browser viewers connect here
 // to exchange SDP. Role is selected via ?role=robot|viewer.
 
-import { handleRobot } from "@/lib/webrtc/hub";
+import { hub } from "@/lib/webrtc/hub";
 
 export function UPGRADE(
   client: import("ws").WebSocket,
@@ -10,13 +10,17 @@ export function UPGRADE(
 ) {
   const role = request.nextUrl.searchParams.get("role");
 
-  if (role === "robot") {
-    handleRobot(client);
-    return;
+  switch (role) {
+    case "robot":
+      hub.handleRobot(client);
+      return;
+    case "viewer":
+      hub.handleViewer(client);
+      return;
+    default:
+      console.warn(`[signaling] rejecting unknown role: ${role}`);
+      client.close(1008, "unknown role");
   }
-
-  console.warn(`[signaling] rejecting unknown role: ${role}`);
-  client.close(1008, "unknown role");
 }
 
 export function GET() {
