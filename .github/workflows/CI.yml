@@ -62,7 +62,6 @@ jobs:
         with:
           push: true
           context: server
-          file: Dockerfile
           platforms: linux/amd64
           tags: ${{ env.REGISTRY }}/${{ env.ORG }}/${{ env.IMAGE_NAME }}:${{ needs.setup.outputs.docker_tag }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.ORG }}/${{ env.IMAGE_NAME }}:buildcache
