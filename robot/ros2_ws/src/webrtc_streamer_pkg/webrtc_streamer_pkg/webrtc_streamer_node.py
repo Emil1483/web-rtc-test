@@ -192,6 +192,10 @@ class WebRtcStreamerNode(Node):
                     ),
                 )
 
+                @transport.on("connectionstatechange")
+                async def on_conn_state(state):
+                    self.get_logger().info(f"send transport state: {state}")
+
                 @transport.on("connect")
                 async def on_connect(dtlsParameters):
                     await self.rpc(

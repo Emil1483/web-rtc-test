@@ -9,8 +9,11 @@
     "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind"
   ],
   "runArgs": [
+    "--network=host",
     "--env=DISPLAY=${localEnv:DISPLAY}",
-    "--env=LIBGL_ALWAYS_SOFTWARE=1"
+    "--env=LIBGL_ALWAYS_SOFTWARE=1",
+    "--env=MEDIASOUP_ANNOUNCED_IP=127.0.0.1",
+    "--env=MEDIASOUP_LISTEN_IP=127.0.0.1"
   ],
   "workspaceFolder": "/repo_root",
   "customizations": {
@@ -28,6 +31,5 @@
       }
     }
   },
-  "forwardPorts": [3000],
   "postCreateCommand": "rosdep update && rosdep install --from-paths /repo_root/robot/ros2_ws/src --ignore-src -r -y && poetry install -C /repo_root/robot/ros2_ws && npm --prefix /repo_root/server install"
 }
