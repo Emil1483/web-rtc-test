@@ -20,7 +20,8 @@ import type {
 } from "werift";
 import type { WebSocket } from "ws";
 
-const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
+import { getIceServers } from "./iceServers";
+
 const PLI_INTERVAL_MS = 2000;
 
 // Behind Docker/NAT, werift only sees container-internal interfaces. Publish a
@@ -34,7 +35,7 @@ const ICE_PORT_MAX = Number(process.env.ICE_PORT_MAX ?? 50019);
 
 function createPeerConnection(): RTCPeerConnection {
   return new RTCPeerConnection({
-    iceServers: ICE_SERVERS,
+    iceServers: getIceServers(),
     iceUseIpv4: true,
     icePortRange: [ICE_PORT_MIN, ICE_PORT_MAX],
     iceAdditionalHostAddresses: PUBLIC_IP ? [PUBLIC_IP] : undefined,

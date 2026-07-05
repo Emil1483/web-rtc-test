@@ -13,6 +13,7 @@ thread. ROS callbacks hand data to the loop via loop.call_soon_threadsafe.
 import asyncio
 import fractions
 import json
+import os
 import threading
 import time
 
@@ -38,6 +39,22 @@ DEFAULT_SIGNALING_URL = "ws://localhost:3000/api/signaling?role=robot"
 STUN_URL = "stun:stun.l.google.com:19302"
 RECONNECT_DELAY_S = 3.0
 VIDEO_CLOCK_RATE = 90000
+
+
+def build_ice_servers():
+    """STUN + optional TURN from env (TURN_URLS, TURN_USERNAME, TURN_CREDENTIAL).
+
+    TURN_URLS is comma-separated, e.g.
+    "turn:1.2.3.4:3478?transport=udp,turn:1.2.3.4:3478?transport=tcp".
+    Without it, only STUN is used (direct connectivity only).
+    """
+    servers = [RTCIceServer(urls=STUN_URL)]
+    turn_urls = [u.strip() for u in os.environ.get("TURN_URLS", "").split(",") if u.strip()]
+    username = os.environ.get("TURN_USERNAME")
+    credential = os.environ.get("TURN_CREDENTIAL")
+    for urls in turn_urls:
+        servers.append(RTCIceServer(urls=urls, username=username, credential=credential))
+    return servers, turn_urls
 
 
 class RosVideoTrack(MediaStreamTrack):
@@ -110,6 +127,24 @@ class WebRtcStreamerNode(Node):
         if channel is not None and channel.readyState == "open":
             channel.send(payload)
 
+    async def _log_transport(self, pc: RTCPeerConnection):
+        # Report the selected ICE path: host/srflx (direct) or relay (TURN).
+        try:
+            stats = await pc.getStats()
+            for report in stats.values():
+                if getattr(report, "type", "") == "candidate-pair" and getattr(
+                    report, "nominated", False
+                ):
+                    local_id = getattr(report, "localCandidateId", None)
+                    local = stats.get(local_id) if local_id else None
+                    ctype = getattr(local, "candidateType", "unknown") if local else "unknown"
+                    suffix = " (TURN)" if ctype == "relay" else ""
+                    self.get_logger().info(f"connected via {ctype}{suffix}")
+                    return
+            self.get_logger().info("connected (candidate type unknown)")
+        except Exception as exc:
+            self.get_logger().warn(f"getStats failed: {exc}")
+
     # --- asyncio / WebRTC (run on the main loop) --------------------------
 
     async def run(self):
@@ -126,7 +161,11 @@ class WebRtcStreamerNode(Node):
         # The server is the offerer (werift interops reliably as offerer). We
         # answer: attach our video track to its recvonly video m-line and send
         # telemetry on the data channel it creates.
-        config = RTCConfiguration(iceServers=[RTCIceServer(urls=STUN_URL)])
+        ice_servers, turn_urls = build_ice_servers()
+        self.get_logger().info(
+            f"TURN {'enabled: ' + ', '.join(turn_urls) if turn_urls else 'disabled (STUN only)'}"
+        )
+        config = RTCConfiguration(iceServers=ice_servers)
         pc = RTCPeerConnection(configuration=config)
         self.video_track = RosVideoTrack()
 
@@ -138,6 +177,8 @@ class WebRtcStreamerNode(Node):
         @pc.on("connectionstatechange")
         async def on_state_change():
             self.get_logger().info(f"connection state: {pc.connectionState}")
+            if pc.connectionState == "connected":
+                await self._log_transport(pc)
 
         try:
             async with websockets.connect(self.signaling_url) as ws:
@@ -146,12 +187,18 @@ class WebRtcStreamerNode(Node):
                     message = json.loads(raw)
                     if message.get("type") != "offer":
                         continue
+
+                    self.get_logger().info(f"Got sdp: {message['sdp'][:60]}...")
+                    self.get_logger().info(f"Got type: {message['type']}")
                     await pc.setRemoteDescription(
                         RTCSessionDescription(sdp=message["sdp"], type=message["type"])
                     )
                     pc.addTrack(self.video_track)
                     # aiortc gathers ICE during setLocalDescription (non-trickle).
                     await pc.setLocalDescription(await pc.createAnswer())
+
+                    self.get_logger().info(f"answer sdp: {pc.localDescription.sdp[:60]}...")
+                    self.get_logger().info(f"answer type: {pc.localDescription.type}")
                     await ws.send(
                         json.dumps(
                             {
@@ -162,6 +209,7 @@ class WebRtcStreamerNode(Node):
                     )
                     self.get_logger().info("answer sent")
         finally:
+            self.get_logger().info("closing peer connection")
             self.channel = None
             self.video_track = None
             await pc.close()
