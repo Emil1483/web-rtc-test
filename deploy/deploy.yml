@@ -8,7 +8,7 @@
   tasks:
     - name: Update .env file
       blockinfile:
-        path: /root/gui/.env
+        path: /root/web-rtc-test/.env
         create: true
         marker: "# {mark} ANSIBLE MANAGED BLOCK"
         block: |
@@ -17,4 +17,4 @@
     - name: Run docker compose
       shell: docker compose up -d
       args:
-        chdir: /root/gui
+        chdir: /root/web-rtc-test
