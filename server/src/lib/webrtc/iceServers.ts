@@ -1,6 +1,6 @@
 // ICE server list (STUN + optional TURN), built from environment so credentials
-// and URLs are never hardcoded. Shared by the hub (werift peers) and the
-// /api/ice-config endpoint (browser peers).
+// and URLs are never hardcoded. Served to browser peers via /api/ice-config
+// (mediasoup transports take iceServers for the optional TURN fallback).
 //
 // Env:
 //   TURN_URLS        comma-separated TURN urls, e.g.

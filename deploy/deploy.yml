@@ -6,6 +6,16 @@
   gather_facts: false
 
   tasks:
+    - name: Ensure deploy dir exists
+      file:
+        path: /root/web-rtc-test
+        state: directory
+
+    - name: Upsert compose file
+      copy:
+        src: compose.yml
+        dest: /root/web-rtc-test/compose.yml
+
     - name: Update .env file
       blockinfile:
         path: /root/web-rtc-test/.env

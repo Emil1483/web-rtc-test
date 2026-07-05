@@ -10,7 +10,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument(
                 "signaling_url",
-                default_value="ws://localhost:3000/api/signaling?role=robot",
+                default_value="ws://localhost:3000/api/sfu",
                 description="WebRTC signaling WebSocket URL on the server",
             ),
             Node(

@@ -1,13 +1,14 @@
-"""WebRTC streamer node.
+"""WebRTC streamer node (mediasoup producer).
 
-Phase 3: the robot side of the SFU. Acts as the WebRTC offerer and bridges ROS
-topics to the server:
+The robot side of the SFU. Connects to the mediasoup signaling endpoint and
+*produces*:
 
   * /camera/image_raw (sensor_msgs/Image, rgb8) -> a VP8 video track
-  * /thrusters        (my_interfaces/Thrusters)  -> JSON on the data channel
+  * /thrusters        (my_interfaces/Thrusters)  -> a data producer (unreliable)
 
-rclpy runs in a background thread; aiortc runs on an asyncio loop in the main
-thread. ROS callbacks hand data to the loop via loop.call_soon_threadsafe.
+Browsers consume these selectively via the server. rclpy runs in a background
+thread; pymediasoup/aiortc run on an asyncio loop in the main thread. ROS
+callbacks hand data to the loop via loop.call_soon_threadsafe.
 """
 
 import asyncio
@@ -22,39 +23,34 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 
-from aiortc import (
-    MediaStreamTrack,
-    RTCConfiguration,
-    RTCIceServer,
-    RTCPeerConnection,
-    RTCSessionDescription,
-)
+from aiortc import MediaStreamTrack
 from av import VideoFrame
 import websockets
+
+from pymediasoup import AiortcHandler, Device
+from pymediasoup.rtp_parameters import RtpCapabilities
+from pymediasoup.models.transport import (
+    DtlsParameters,
+    IceCandidate,
+    IceParameters,
+)
+from pymediasoup.sctp_parameters import SctpParameters
 
 from sensor_msgs.msg import Image
 from my_interfaces.msg import Thrusters
 
-DEFAULT_SIGNALING_URL = "ws://localhost:3000/api/signaling?role=robot"
-STUN_URL = "stun:stun.l.google.com:19302"
+DEFAULT_SIGNALING_URL = "ws://localhost:3000/api/sfu"
 RECONNECT_DELAY_S = 3.0
 VIDEO_CLOCK_RATE = 90000
 
 
-def build_ice_servers():
-    """STUN + optional TURN from env (TURN_URLS, TURN_USERNAME, TURN_CREDENTIAL).
-
-    TURN_URLS is comma-separated, e.g.
-    "turn:1.2.3.4:3478?transport=udp,turn:1.2.3.4:3478?transport=tcp".
-    Without it, only STUN is used (direct connectivity only).
-    """
-    servers = [RTCIceServer(urls=STUN_URL)]
-    turn_urls = [u.strip() for u in os.environ.get("TURN_URLS", "").split(",") if u.strip()]
-    username = os.environ.get("TURN_USERNAME")
-    credential = os.environ.get("TURN_CREDENTIAL")
-    for urls in turn_urls:
-        servers.append(RTCIceServer(urls=urls, username=username, credential=credential))
-    return servers, turn_urls
+def _dump(model):
+    """Serialize a pymediasoup pydantic model to a JSON-ready dict (camelCase)."""
+    if hasattr(model, "model_dump"):
+        return model.model_dump(mode="json", by_alias=True, exclude_none=True)
+    if hasattr(model, "json"):
+        return json.loads(model.json(by_alias=True, exclude_none=True))
+    return model
 
 
 class RosVideoTrack(MediaStreamTrack):
@@ -68,8 +64,6 @@ class RosVideoTrack(MediaStreamTrack):
         self._start = None
 
     def push(self, frame: VideoFrame):
-        # Runs on the asyncio loop (via call_soon_threadsafe). Keep only the
-        # newest frame so a slow encoder never builds latency.
         if self._queue.full():
             try:
                 self._queue.get_nowait()
@@ -95,9 +89,13 @@ class WebRtcStreamerNode(Node):
             self.get_parameter("signaling_url").get_parameter_value().string_value
         )
 
-        # Set per-connection in _connect_once; ROS callbacks guard against None.
         self.video_track: RosVideoTrack | None = None
-        self.channel = None
+        self.data_producer = None
+
+        # Signaling RPC state (per connection).
+        self._ws = None
+        self._pending: dict[int, asyncio.Future] = {}
+        self._next_id = 1
 
         self.create_subscription(Image, "camera/image_raw", self.on_image, 10)
         self.create_subscription(Thrusters, "thrusters", self.on_thrusters, 10)
@@ -105,7 +103,7 @@ class WebRtcStreamerNode(Node):
             f"WebRtcStreamerNode started, signaling: {self.signaling_url}"
         )
 
-    # --- ROS callbacks (run on the rclpy spin thread) ---------------------
+    # --- ROS callbacks (rclpy spin thread) --------------------------------
 
     def on_image(self, msg: Image):
         track = self.video_track
@@ -123,29 +121,34 @@ class WebRtcStreamerNode(Node):
         self.loop.call_soon_threadsafe(self._send_telemetry, payload)
 
     def _send_telemetry(self, payload: str):
-        channel = self.channel
-        if channel is not None and channel.readyState == "open":
-            channel.send(payload)
+        dp = self.data_producer
+        if dp is not None and dp.readyState == "open":
+            dp.send(payload)
 
-    async def _log_transport(self, pc: RTCPeerConnection):
-        # Report the selected ICE path: host/srflx (direct) or relay (TURN).
-        try:
-            stats = await pc.getStats()
-            for report in stats.values():
-                if getattr(report, "type", "") == "candidate-pair" and getattr(
-                    report, "nominated", False
-                ):
-                    local_id = getattr(report, "localCandidateId", None)
-                    local = stats.get(local_id) if local_id else None
-                    ctype = getattr(local, "candidateType", "unknown") if local else "unknown"
-                    suffix = " (TURN)" if ctype == "relay" else ""
-                    self.get_logger().info(f"connected via {ctype}{suffix}")
-                    return
-            self.get_logger().info("connected (candidate type unknown)")
-        except Exception as exc:
-            self.get_logger().warn(f"getStats failed: {exc}")
+    # --- signaling RPC ----------------------------------------------------
 
-    # --- asyncio / WebRTC (run on the main loop) --------------------------
+    async def rpc(self, action: str, params: dict | None = None):
+        assert self._ws is not None
+        request_id = self._next_id
+        self._next_id += 1
+        future: asyncio.Future = self.loop.create_future()
+        self._pending[request_id] = future
+        await self._ws.send(json.dumps({"id": request_id, "action": action, **(params or {})}))
+        return await future
+
+    async def _reader(self, ws):
+        async for raw in ws:
+            msg = json.loads(raw)
+            mid = msg.get("id")
+            if mid is not None and mid in self._pending:
+                fut = self._pending.pop(mid)
+                if msg.get("ok"):
+                    fut.set_result(msg.get("data"))
+                else:
+                    fut.set_exception(RuntimeError(msg.get("error", "rpc error")))
+            # server events (newProducer, etc.) are irrelevant to a producer
+
+    # --- asyncio / mediasoup (main loop) ----------------------------------
 
     async def run(self):
         while rclpy.ok():
@@ -158,61 +161,85 @@ class WebRtcStreamerNode(Node):
                 await asyncio.sleep(RECONNECT_DELAY_S)
 
     async def _connect_once(self):
-        # The server is the offerer (werift interops reliably as offerer). We
-        # answer: attach our video track to its recvonly video m-line and send
-        # telemetry on the data channel it creates.
-        ice_servers, turn_urls = build_ice_servers()
-        self.get_logger().info(
-            f"TURN {'enabled: ' + ', '.join(turn_urls) if turn_urls else 'disabled (STUN only)'}"
-        )
-        config = RTCConfiguration(iceServers=ice_servers)
-        pc = RTCPeerConnection(configuration=config)
         self.video_track = RosVideoTrack()
+        self._pending = {}
+        transport = None
 
-        @pc.on("datachannel")
-        def on_datachannel(channel):
-            self.channel = channel
-            self.get_logger().info(f"data channel: {channel.label}")
-
-        @pc.on("connectionstatechange")
-        async def on_state_change():
-            self.get_logger().info(f"connection state: {pc.connectionState}")
-            if pc.connectionState == "connected":
-                await self._log_transport(pc)
-
-        try:
-            async with websockets.connect(self.signaling_url) as ws:
-                self.get_logger().info("connected to signaling, awaiting offer")
-                async for raw in ws:
-                    message = json.loads(raw)
-                    if message.get("type") != "offer":
-                        continue
-
-                    self.get_logger().info(f"Got sdp: {message['sdp'][:60]}...")
-                    self.get_logger().info(f"Got type: {message['type']}")
-                    await pc.setRemoteDescription(
-                        RTCSessionDescription(sdp=message["sdp"], type=message["type"])
+        async with websockets.connect(self.signaling_url) as ws:
+            self._ws = ws
+            reader_task = asyncio.ensure_future(self._reader(ws))
+            try:
+                # Load device with the router's capabilities.
+                router_caps = await self.rpc("getRtpCapabilities")
+                device = Device(
+                    handlerFactory=AiortcHandler.createFactory(
+                        tracks=[self.video_track], loop=self.loop
                     )
-                    pc.addTrack(self.video_track)
-                    # aiortc gathers ICE during setLocalDescription (non-trickle).
-                    await pc.setLocalDescription(await pc.createAnswer())
+                )
+                await device.load(RtpCapabilities(**router_caps))
 
-                    self.get_logger().info(f"answer sdp: {pc.localDescription.sdp[:60]}...")
-                    self.get_logger().info(f"answer type: {pc.localDescription.type}")
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": pc.localDescription.type,
-                                "sdp": pc.localDescription.sdp,
-                            }
-                        )
+                # Create the send transport (server dicts -> pydantic models).
+                params = await self.rpc("createTransport", {"direction": "send"})
+                transport = device.createSendTransport(
+                    id=params["id"],
+                    iceParameters=IceParameters(**params["iceParameters"]),
+                    iceCandidates=[IceCandidate(**c) for c in params["iceCandidates"]],
+                    dtlsParameters=DtlsParameters(**params["dtlsParameters"]),
+                    sctpParameters=(
+                        SctpParameters(**params["sctpParameters"])
+                        if params.get("sctpParameters")
+                        else None
+                    ),
+                )
+
+                @transport.on("connect")
+                async def on_connect(dtlsParameters):
+                    await self.rpc(
+                        "connectTransport",
+                        {"transportId": transport.id, "dtlsParameters": _dump(dtlsParameters)},
                     )
-                    self.get_logger().info("answer sent")
-        finally:
-            self.get_logger().info("closing peer connection")
-            self.channel = None
-            self.video_track = None
-            await pc.close()
+
+                @transport.on("produce")
+                async def on_produce(kind, rtpParameters, appData):
+                    res = await self.rpc(
+                        "produce",
+                        {
+                            "transportId": transport.id,
+                            "kind": kind,
+                            "rtpParameters": _dump(rtpParameters),
+                            "appData": appData or {},
+                        },
+                    )
+                    return res["id"]
+
+                @transport.on("producedata")
+                async def on_producedata(sctpStreamParameters, label, protocol, appData):
+                    res = await self.rpc(
+                        "produceData",
+                        {
+                            "transportId": transport.id,
+                            "sctpStreamParameters": _dump(sctpStreamParameters),
+                            "label": label,
+                            "protocol": protocol,
+                            "appData": appData or {},
+                        },
+                    )
+                    return res["id"]
+
+                await transport.produce(track=self.video_track, stopTracks=False)
+                self.data_producer = await transport.produceData(
+                    ordered=False, maxRetransmits=0, label="telemetry"
+                )
+                self.get_logger().info("producing video + telemetry")
+
+                await reader_task  # returns when the socket closes
+            finally:
+                reader_task.cancel()
+                self.data_producer = None
+                self.video_track = None
+                self._ws = None
+                if transport is not None:
+                    await transport.close()
 
 
 def main(args=None):
@@ -221,7 +248,6 @@ def main(args=None):
     asyncio.set_event_loop(loop)
     node = WebRtcStreamerNode(loop)
 
-    # rclpy spins in a background thread; the main thread runs the asyncio loop.
     ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     ros_thread.start()
 

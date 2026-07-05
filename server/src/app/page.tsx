@@ -1,29 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { Device } from "mediasoup-client";
+import type { types } from "mediasoup-client";
 import Box from "@mui/material/Box";
 import Chip from "@mui/material/Chip";
 import Container from "@mui/material/Container";
 import Paper from "@mui/material/Paper";
 import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
-
-const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
-
-// Non-trickle: resolve once ICE gathering finished so the offer carries all
-// candidates (matches the robot and server behaviour).
-function waitForIceGathering(pc: RTCPeerConnection): Promise<void> {
-  if (pc.iceGatheringState === "complete") return Promise.resolve();
-  return new Promise((resolve) => {
-    const check = () => {
-      if (pc.iceGatheringState === "complete") {
-        pc.removeEventListener("icegatheringstatechange", check);
-        resolve();
-      }
-    };
-    pc.addEventListener("icegatheringstatechange", check);
-  });
-}
 
 const THRUSTER_COLORS = ["#42a5f5", "#66bb6a", "#ffa726", "#ef5350"];
 
@@ -48,7 +33,6 @@ function ThrusterBar({ index, value }: { index: number; value: number }) {
           overflow: "hidden",
         }}
       >
-        {/* center (zero) reference */}
         <Box
           sx={{
             position: "absolute",
@@ -59,7 +43,6 @@ function ThrusterBar({ index, value }: { index: number; value: number }) {
             bgcolor: "divider",
           }}
         />
-        {/* fill from center to value */}
         <Box
           sx={{
             position: "absolute",
@@ -75,12 +58,56 @@ function ThrusterBar({ index, value }: { index: number; value: number }) {
   );
 }
 
+// Minimal request/response over the signaling WebSocket, correlated by id.
+class Signaling {
+  private ws: WebSocket;
+  private nextId = 1;
+  private pending = new Map<
+    number,
+    { resolve: (v: unknown) => void; reject: (e: Error) => void }
+  >();
+  onEvent: (msg: Record<string, unknown>) => void = () => {};
+
+  constructor(url: string) {
+    this.ws = new WebSocket(url);
+    this.ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (typeof msg.id === "number" && this.pending.has(msg.id)) {
+        const p = this.pending.get(msg.id)!;
+        this.pending.delete(msg.id);
+        if (msg.ok) p.resolve(msg.data);
+        else p.reject(new Error(msg.error ?? "rpc error"));
+      } else if (msg.event) {
+        this.onEvent(msg);
+      }
+    };
+  }
+
+  ready(): Promise<void> {
+    return new Promise((res, rej) => {
+      this.ws.onopen = () => res();
+      this.ws.onerror = () => rej(new Error("ws error"));
+    });
+  }
+
+  request<T = unknown>(action: string, params: object = {}): Promise<T> {
+    const id = this.nextId++;
+    return new Promise<T>((resolve, reject) => {
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+      this.ws.send(JSON.stringify({ id, action, ...params }));
+    });
+  }
+
+  close() {
+    this.ws.close();
+  }
+}
+
 export default function Home() {
-  const [state, setState] = useState<RTCPeerConnectionState>("new");
+  const [state, setState] = useState<string>("new");
   const [values, setValues] = useState<number[]>([0, 0, 0, 0]);
   const [hz, setHz] = useState(0);
   const [robotOnline, setRobotOnline] = useState(false);
-  const [transport, setTransport] = useState<string>("");
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const latestValues = useRef<number[]>([0, 0, 0, 0]);
@@ -89,91 +116,123 @@ export default function Home() {
 
   useEffect(() => {
     let cancelled = false;
-    let pc: RTCPeerConnection | null = null;
-    let ws: WebSocket | null = null;
+    let signaling: Signaling | null = null;
+    let recvTransport: types.Transport | null = null;
 
-    // After connecting, find the selected ICE candidate pair and report the
-    // path type: host / srflx (direct) or relay (going through TURN).
-    const logTransport = async (peer: RTCPeerConnection) => {
-      const stats = await peer.getStats();
-      let type = "unknown";
-      stats.forEach((r) => {
-        const rp = r as { type: string; state?: string; nominated?: boolean; localCandidateId?: string };
-        if (rp.type === "candidate-pair" && rp.state === "succeeded" && rp.nominated) {
-          const local = rp.localCandidateId ? stats.get(rp.localCandidateId) : undefined;
-          if (local) type = (local as { candidateType: string }).candidateType;
+    const handleTelemetry = (raw: string) => {
+      try {
+        const data = JSON.parse(raw);
+        if (Array.isArray(data.v)) {
+          msgTimes.current.push(performance.now());
+          if (typeof data.t === "number" && data.t > lastT.current) {
+            lastT.current = data.t;
+            latestValues.current = data.v;
+          }
         }
+      } catch {
+        /* ignore malformed */
+      }
+    };
+
+    const consumeVideo = async (producerId: string, device: Device) => {
+      if (!recvTransport) return;
+      const p = await signaling!.request<{
+        id: string;
+        producerId: string;
+        kind: types.MediaKind;
+        rtpParameters: types.RtpParameters;
+      }>("consume", {
+        transportId: recvTransport.id,
+        producerId,
+        rtpCapabilities: device.rtpCapabilities,
       });
-      setTransport(type);
-      console.log(`[webrtc] connected via ${type}${type === "relay" ? " (TURN)" : ""}`);
+      const consumer = await recvTransport.consume(p);
+      if (videoRef.current) {
+        videoRef.current.srcObject = new MediaStream([consumer.track]);
+      }
+      await signaling!.request("resumeConsumer", { consumerId: consumer.id });
+      setRobotOnline(true);
+    };
+
+    const consumeData = async (dataProducerId: string) => {
+      if (!recvTransport) return;
+      const p = await signaling!.request<{
+        id: string;
+        dataProducerId: string;
+        sctpStreamParameters: types.SctpStreamParameters;
+        label: string;
+        protocol: string;
+      }>("consumeData", { transportId: recvTransport.id, dataProducerId });
+      const dc = await recvTransport.consumeData(p);
+      dc.on("message", (data: string) => handleTelemetry(data));
     };
 
     (async () => {
-      // Fetch ICE config (STUN + optional TURN) from the server so credentials
-      // aren't in the bundle. Fall back to STUN if it fails.
-      let iceServers: RTCIceServer[] = [...ICE_SERVERS];
+      // ICE servers (STUN + optional TURN) for the transport.
+      let iceServers: RTCIceServer[] = [];
       try {
         const res = await fetch("/api/ice-config");
         const cfg = await res.json();
         if (Array.isArray(cfg.iceServers)) iceServers = cfg.iceServers;
       } catch {
-        /* fall back to STUN */
+        /* direct only */
       }
-      if (cancelled) return;
-
-      pc = new RTCPeerConnection({ iceServers });
-
-      // The server is the offerer. It sends us the forwarded robot video track
-      // and a data channel carrying fanned-out thruster telemetry; we answer.
-      pc.ontrack = (e) => {
-        if (videoRef.current) videoRef.current.srcObject = e.streams[0];
-      };
-
-      pc.ondatachannel = (e) => {
-        e.channel.onmessage = (ev) => {
-          try {
-            const data = JSON.parse(ev.data);
-            if (data.status) {
-              setRobotOnline(data.status === "online");
-              // Robot gone: reset the ordering guard so a reconnecting robot
-              // (whose timestamps may start lower) isn't blocked.
-              if (data.status === "offline") lastT.current = -Infinity;
-            } else if (Array.isArray(data.v)) {
-              msgTimes.current.push(performance.now());
-              // Unordered channel: drop values that arrive out of order (a
-              // packet older than one we've already shown). `t` is robot time.
-              if (typeof data.t === "number" && data.t > lastT.current) {
-                lastT.current = data.t;
-                latestValues.current = data.v;
-              }
-            }
-          } catch {
-            /* ignore malformed */
-          }
-        };
-      };
-
-      pc.onconnectionstatechange = () => {
-        if (!pc) return;
-        setState(pc.connectionState);
-        if (pc.connectionState === "connected") void logTransport(pc);
-      };
 
       const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(
-        `${proto}://${window.location.host}/api/signaling?role=viewer`,
-      );
+      signaling = new Signaling(`${proto}://${window.location.host}/api/sfu`);
+      await signaling.ready();
+      if (cancelled) return;
 
-      ws.onmessage = async (e) => {
-        const message = JSON.parse(e.data);
-        if (message.type !== "offer" || !pc) return;
-        await pc.setRemoteDescription(message);
-        await pc.setLocalDescription(await pc.createAnswer());
-        await waitForIceGathering(pc);
-        const answer = pc.localDescription;
-        if (answer) ws?.send(JSON.stringify({ type: answer.type, sdp: answer.sdp }));
+      const device = new Device();
+      const routerRtpCapabilities = await signaling.request<types.RtpCapabilities>(
+        "getRtpCapabilities",
+      );
+      await device.load({ routerRtpCapabilities });
+
+      // Create the receive transport.
+      const params = await signaling.request<types.TransportOptions>(
+        "createTransport",
+        { direction: "recv" },
+      );
+      recvTransport = device.createRecvTransport({ ...params, iceServers });
+
+      recvTransport.on("connect", ({ dtlsParameters }, cb, errback) => {
+        signaling!
+          .request("connectTransport", {
+            transportId: recvTransport!.id,
+            dtlsParameters,
+          })
+          .then(() => cb())
+          .catch(errback);
+      });
+      recvTransport.on("connectionstatechange", (s) => setState(s));
+
+      // Server pushes availability events; consume what each screen needs.
+      signaling.onEvent = (msg) => {
+        if (msg.event === "newProducer" && msg.kind === "video") {
+          void consumeVideo(msg.producerId as string, device);
+        } else if (msg.event === "newDataProducer") {
+          // This screen wants telemetry; other screens would filter on label.
+          if (msg.label === "telemetry") void consumeData(msg.dataProducerId as string);
+        } else if (msg.event === "producerClosed") {
+          setRobotOnline(false);
+          lastT.current = -Infinity;
+          if (videoRef.current) videoRef.current.srcObject = null;
+        }
       };
-    })();
+
+      // Consume anything already being produced (robot connected first).
+      const existing = await signaling.request<{
+        producers: { producerId: string; kind: string }[];
+        dataProducers: { dataProducerId: string; label: string }[];
+      }>("getProducers");
+      for (const pr of existing.producers) {
+        if (pr.kind === "video") await consumeVideo(pr.producerId, device);
+      }
+      for (const dp of existing.dataProducers) {
+        if (dp.label === "telemetry") await consumeData(dp.dataProducerId);
+      }
+    })().catch((err) => console.error("[sfu] setup failed:", err));
 
     // Render telemetry at animation rate, decoupled from the 100 Hz stream.
     let raf = 0;
@@ -189,8 +248,8 @@ export default function Home() {
     return () => {
       cancelled = true;
       cancelAnimationFrame(raf);
-      ws?.close();
-      pc?.close();
+      recvTransport?.close();
+      signaling?.close();
     };
   }, []);
 
@@ -208,17 +267,7 @@ export default function Home() {
           sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}
         >
           <Typography variant="h4">Robot Telemetry</Typography>
-          <Stack direction="row" spacing={1}>
-            {transport && (
-              <Chip
-                label={transport === "relay" ? "via TURN" : "direct"}
-                color={transport === "relay" ? "info" : "default"}
-                size="small"
-                variant="outlined"
-              />
-            )}
-            <Chip label={`WebRTC: ${state}`} color={color} size="small" />
-          </Stack>
+          <Chip label={`WebRTC: ${state}`} color={color} size="small" />
         </Box>
 
         <Paper
@@ -253,9 +302,7 @@ export default function Home() {
         </Paper>
 
         <Paper variant="outlined" sx={{ p: 2 }}>
-          <Box
-            sx={{ display: "flex", justifyContent: "space-between", mb: 2 }}
-          >
+          <Box sx={{ display: "flex", justifyContent: "space-between", mb: 2 }}>
             <Typography variant="h6">Thrusters</Typography>
             <Chip
               label={`${hz} Hz`}

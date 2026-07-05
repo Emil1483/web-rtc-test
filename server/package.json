@@ -14,12 +14,12 @@
     "@emotion/styled": "^11.14.1",
     "@mui/icons-material": "^9.2.0",
     "@mui/material": "^9.2.0",
+    "mediasoup": "^3.21.0",
+    "mediasoup-client": "^3.21.0",
     "next": "16.2.9",
     "next-ws": "^2.2.8",
     "react": "19.2.7",
     "react-dom": "19.2.7",
-    "react-use-websocket": "^4.13.0",
-    "werift": "^0.23.0",
     "ws": "^8.21.0"
   },
   "devDependencies": {
