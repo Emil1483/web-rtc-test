@@ -12,7 +12,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  ORG: Emil1483
+  ORG: emil1483
   IMAGE_NAME: web-rtc-test
 
 jobs:
