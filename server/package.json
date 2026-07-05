@@ -1,0 +1,35 @@
+{
+  "name": "server",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "prepare": "next-ws patch"
+  },
+  "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@mui/icons-material": "^9.2.0",
+    "@mui/material": "^9.2.0",
+    "next": "16.2.9",
+    "next-ws": "^2.2.8",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "react-use-websocket": "^4.13.0",
+    "werift": "^0.23.0",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.18.1",
+    "babel-plugin-react-compiler": "1.0.0",
+    "eslint": "^10.6.0",
+    "eslint-config-next": "16.2.9",
+    "typescript": "^6.0.3"
+  }
+}
