@@ -7,6 +7,7 @@
 
 import { Device } from "mediasoup-client";
 import type { types } from "mediasoup-client";
+import { getIceServers } from "@/lib/webrtc/iceServers";
 
 export class Signaling {
   private ws: WebSocket;
@@ -69,9 +70,7 @@ export async function connectToSfu(
   // ICE servers (STUN + optional TURN) for the transport.
   let iceServers: RTCIceServer[] = [];
   try {
-    const res = await fetch("/api/ice-config");
-    const cfg = await res.json();
-    if (Array.isArray(cfg.iceServers)) iceServers = cfg.iceServers;
+    iceServers = await getIceServers();
   } catch {
     /* direct only */
   }

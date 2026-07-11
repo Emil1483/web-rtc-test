@@ -1,27 +1,17 @@
 // mediasoup signaling endpoint (next-ws). One WebSocket per peer (robot or
-// browser). The Peer object handles the request/response protocol; the router
-// is initialized lazily on the first connection.
+// browser). Proto4WebrtcSfu (npm package "proto4webrtc") owns the request/
+// response protocol and lazily connects the Worker/Router on first use.
 
-import { initSfu, Peer } from "@/lib/mediasoup/sfu";
+import { sfu } from "@/lib/mediasoup/sfu";
 
-export async function UPGRADE(
+export function UPGRADE(
   client: import("ws").WebSocket,
   server: import("ws").WebSocketServer,
   request: import("next/server").NextRequest,
 ) {
-  await initSfu();
-
-  const peer = new Peer(client);
   console.log("[sfu] peer connected");
-
-  client.on("message", (raw) => {
-    void peer.handle(raw);
-  });
-
-  client.on("close", () => {
-    console.log("[sfu] peer disconnected");
-    peer.close();
-  });
+  sfu.handleWSClient(client);
+  client.on("close", () => console.log("[sfu] peer disconnected"));
 }
 
 export function GET() {

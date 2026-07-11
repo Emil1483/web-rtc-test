@@ -1,6 +1,9 @@
+"use server";
+
 // ICE server list (STUN + optional TURN), built from environment so credentials
-// and URLs are never hardcoded. Served to browser peers via /api/ice-config
-// (mediasoup transports take iceServers for the optional TURN fallback).
+// and URLs are never hardcoded. Served to browser peers via the getIceServers
+// server action (mediasoup transports take iceServers for the optional TURN
+// fallback).
 //
 // Env:
 //   TURN_URLS        comma-separated TURN urls, e.g.
@@ -17,7 +20,7 @@ export interface IceServer {
 
 let loggedConfig = false;
 
-export function getIceServers(): IceServer[] {
+export async function getIceServers(): Promise<IceServer[]> {
   const servers: IceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
 
   const turnUrls = (process.env.TURN_URLS ?? "")
