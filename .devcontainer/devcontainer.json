@@ -22,7 +22,8 @@
       "extensions": [
         "ms-python.python",
         "dbaeumer.vscode-eslint",
-        "esbenp.prettier-vscode"
+        "esbenp.prettier-vscode",
+        "bufbuild.vscode-buf"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/repo_root/robot/ros2_ws/.venv/bin/python",

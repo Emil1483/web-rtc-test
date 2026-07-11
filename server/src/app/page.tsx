@@ -17,6 +17,7 @@ import {
   type ProducerList,
   type SfuConnection,
 } from "@/lib/sfuClient";
+import { CameraStream, ThrustersStream, type Thrusters } from "@/gen/proto4webrtc";
 
 const THRUSTER_COLORS = ["#42a5f5", "#66bb6a", "#ffa726", "#ef5350"];
 
@@ -81,18 +82,11 @@ export default function Home() {
     let cancelled = false;
     let conn: SfuConnection | null = null;
 
-    const handleTelemetry = (raw: string) => {
-      try {
-        const data = JSON.parse(raw);
-        if (Array.isArray(data.v)) {
-          msgTimes.current.push(performance.now());
-          if (typeof data.t === "number" && data.t > lastT.current) {
-            lastT.current = data.t;
-            latestValues.current = data.v;
-          }
-        }
-      } catch {
-        /* ignore malformed */
+    const handleTelemetry = (msg: Thrusters) => {
+      msgTimes.current.push(performance.now());
+      if (msg.stamp > lastT.current) {
+        lastT.current = msg.stamp;
+        latestValues.current = [msg.value0, msg.value1, msg.value2, msg.value3];
       }
     };
 
@@ -106,7 +100,7 @@ export default function Home() {
 
     const onTelemetry = async (dataProducerId: string) => {
       const dc = await consumeData(conn!, dataProducerId);
-      dc.on("message", (data: string) => handleTelemetry(data));
+      ThrustersStream.attach(dc, handleTelemetry);
     };
 
     (async () => {
@@ -115,10 +109,10 @@ export default function Home() {
 
       // Server pushes availability events; consume what this screen needs.
       conn.signaling.onEvent = (msg) => {
-        if (msg.event === "newProducer" && msg.kind === "video") {
+        if (msg.event === "newProducer" && msg.kind === CameraStream.kind) {
           void onVideo(msg.producerId as string);
         } else if (msg.event === "newDataProducer") {
-          if (msg.label === "telemetry") void onTelemetry(msg.dataProducerId as string);
+          if (msg.label === ThrustersStream.label) void onTelemetry(msg.dataProducerId as string);
         } else if (msg.event === "producerClosed") {
           setRobotOnline(false);
           lastT.current = -Infinity;
@@ -129,10 +123,10 @@ export default function Home() {
       // Consume anything already being produced (robot connected first).
       const existing = await conn.signaling.request<ProducerList>("getProducers");
       for (const pr of existing.producers) {
-        if (pr.kind === "video") await onVideo(pr.producerId);
+        if (pr.kind === CameraStream.kind) await onVideo(pr.producerId);
       }
       for (const dp of existing.dataProducers) {
-        if (dp.label === "telemetry") await onTelemetry(dp.dataProducerId);
+        if (dp.label === ThrustersStream.label) await onTelemetry(dp.dataProducerId);
       }
     })().catch((err) => console.error("[sfu] setup failed:", err));
 

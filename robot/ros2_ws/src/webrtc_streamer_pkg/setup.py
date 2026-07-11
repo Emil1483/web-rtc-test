@@ -1,6 +1,18 @@
+from pathlib import Path
+
 from setuptools import find_packages, setup
 
+from proto4webrtc_codegen import generate
+
 package_name = 'webrtc_streamer_pkg'
+
+# Regenerate the stream code (pb2 messages + mediasoup producer wrappers)
+# from the repo's protofiles on every build. proto4webrtc/options.proto is
+# bundled with the pip package and added to the include path automatically.
+# The generated top-level packages (rov, proto4webrtc, proto4webrtc_gen) land
+# next to webrtc_streamer_pkg/ and are picked up by find_packages() below.
+_here = Path(__file__).resolve().parent
+generate(proto_dirs=[_here.parents[3] / 'proto'], out_dir=_here)
 
 setup(
     name=package_name,

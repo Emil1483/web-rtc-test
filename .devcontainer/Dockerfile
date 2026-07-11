@@ -16,7 +16,11 @@ RUN apt-get update && apt-get install -y \
 # Install Node.js 22 LTS + npm (for the Next.js server in /repo_root/server)
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # buf CLI for `buf dep update` / `buf generate` at the repo root (buf.yaml
+    # lives there, not under server/, so the npm-local server/node_modules/.bin/buf
+    # devDependency isn't on PATH for root-level commands).
+    && npm install -g @bufbuild/buf
 
 ENV POETRY_VIRTUALENVS_IN_PROJECT=true
 ENV POETRY_VIRTUALENVS_OPTIONS_SYSTEM_SITE_PACKAGES=true

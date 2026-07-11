@@ -4,9 +4,9 @@
 // no video, no telemetry — demonstrating selective subscribe: the server never
 // sends this page the streams it doesn't ask for.
 //
-// Wire format (set by webrtc_streamer_node): little-endian float64 timestamp,
-// then packed float32 x,y,z per point. Rendered on a 2D canvas with a small
-// hand-rolled orbit camera (drag to rotate, wheel to zoom) — no 3D library.
+// Wire format: rov.streams.PointCloud (see proto4webrtc.ts), points packed as
+// float32 x,y,z per point. Rendered on a 2D canvas with a small hand-rolled
+// orbit camera (drag to rotate, wheel to zoom) — no 3D library.
 
 import { useEffect, useRef, useState } from "react";
 import NextLink from "next/link";
@@ -24,6 +24,7 @@ import {
   type ProducerList,
   type SfuConnection,
 } from "@/lib/sfuClient";
+import { PointCloudStream, type PointCloud } from "@/gen/proto4webrtc";
 
 export default function PointcloudPage() {
   const [state, setState] = useState<string>("new");
@@ -42,19 +43,18 @@ export default function PointcloudPage() {
     let cancelled = false;
     let conn: SfuConnection | null = null;
 
-    const handleCloud = (data: unknown) => {
-      if (!(data instanceof ArrayBuffer) || data.byteLength < 8) return;
-      const t = new DataView(data).getFloat64(0, true);
+    const handleCloud = (msg: PointCloud) => {
       msgTimes.current.push(performance.now());
-      if (t <= lastT.current) return; // unordered delivery: drop stale clouds
-      lastT.current = t;
-      points.current = new Float32Array(data, 8);
+      if (msg.stamp <= lastT.current) return; // unordered delivery: drop stale clouds
+      lastT.current = msg.stamp;
+      // .slice() gives a fresh, 4-byte-aligned buffer so the Float32Array
+      // view over msg.data is always valid regardless of its source offset.
+      points.current = new Float32Array(msg.data.slice().buffer);
     };
 
     const onPointcloud = async (dataProducerId: string) => {
       const dc = await consumeData(conn!, dataProducerId);
-      dc.binaryType = "arraybuffer";
-      dc.on("message", handleCloud);
+      PointCloudStream.attach(dc, handleCloud);
       setRobotOnline(true);
     };
 
@@ -63,7 +63,7 @@ export default function PointcloudPage() {
       if (cancelled) return;
 
       conn.signaling.onEvent = (msg) => {
-        if (msg.event === "newDataProducer" && msg.label === "pointcloud") {
+        if (msg.event === "newDataProducer" && msg.label === PointCloudStream.label) {
           void onPointcloud(msg.dataProducerId as string);
         } else if (msg.event === "dataProducerClosed" || msg.event === "producerClosed") {
           setRobotOnline(false);
@@ -74,7 +74,7 @@ export default function PointcloudPage() {
 
       const existing = await conn.signaling.request<ProducerList>("getProducers");
       for (const dp of existing.dataProducers) {
-        if (dp.label === "pointcloud") await onPointcloud(dp.dataProducerId);
+        if (dp.label === PointCloudStream.label) await onPointcloud(dp.dataProducerId);
       }
     })().catch((err) => console.error("[sfu] setup failed:", err));
 
