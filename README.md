@@ -7,6 +7,10 @@ a second). A server in the cloud relays both to every browser that's watching.
 The robot sends its data **once**; the server makes the copies. So one viewer or
 fifty, the robot's workload is the same.
 
+The forwarding engine on the server is **mediasoup**, a purpose-built SFU
+library. (An earlier version of this project used a hand-rolled forwarder on top
+of `werift`; see the git history for that design and why it was replaced.)
+
 ---
 
 ## Vocabulary (plain language)
@@ -17,37 +21,50 @@ You don't need a networking background. Here's every term used below, in one pla
   audio/video/data (it's what video-call apps use). It lets two programs send
   live data directly to each other. We use it for both the video and the numbers.
 - **Peer** — one end of a *single* WebRTC connection (the robot, the server, or a
-  browser). "Peer-to-peer" means one connection runs directly between its two
-  peers. **It does not mean the robot talks straight to the browser.** In this
-  system there are two separate connections — robot↔server and server↔browser —
-  and the server is a peer on both. The robot→browser path is always **two hops,
-  through the server** (that's what makes the server an SFU / middleman).
+  browser). **The robot never talks straight to the browser.** There are two
+  separate connections — robot↔server and server↔browser — and the server is a
+  peer on both. The robot→browser path is always **two hops, through the server**
+  (that's what makes the server an SFU / middleman).
+- **SFU (Selective Forwarding Unit)** — a server that receives one media stream
+  and forwards copies to many viewers, **without re-compressing** it. The
+  alternative — the robot sending a separate stream to each browser — would
+  overload the robot.
+- **mediasoup** — the SFU library we use on the server. Its terms, which appear
+  everywhere below:
+  - **Worker** — a separate native process (written in C++) that mediasoup
+    launches to do all the actual packet forwarding. The Node.js server just
+    tells it what to do.
+  - **Router** — a "room" inside a worker. Everything here lives in one router:
+    one robot, many viewers.
+  - **Transport** — one peer's connection into the router. Each peer creates its
+    own.
+  - **Producer** — a stream a peer sends *into* the router (the robot's video).
+  - **Consumer** — a copy of a producer that a peer receives *out of* the router
+    (each browser's copy of the video).
+  - **Data producer / data consumer** — the same idea for arbitrary messages
+    instead of video (the thruster numbers).
 - **Media track** — a live stream of video (or audio). Here: the robot's camera.
 - **Data channel** — a side pipe on the same connection for sending arbitrary
   messages (here: the thruster numbers, as small chunks of JSON).
-- **Signaling** — the short "let's connect" conversation two peers have *before*
-  the real connection opens. They swap a description of what they support (codecs,
-  network addresses). We do this over a **WebSocket** (a normal always-open
-  browser↔server text connection).
+- **Signaling** — the setup conversation a peer has with the server *before* the
+  real connection opens (what codecs, what network addresses, "please give me a
+  copy of the video"). We do this over a **WebSocket** (a normal always-open
+  text connection) at `/api/sfu`.
 - **Reliable vs. unreliable delivery** — a data channel can guarantee every
   message arrives in order (like email), or it can favor speed and *drop* old
   data if the network hiccups (like a live phone call). For 100 Hz values, stale
   numbers are useless, so we choose **unreliable** — always get the newest.
-- **SFU (Selective Forwarding Unit)** — a server that receives one media stream
-  and forwards copies to many viewers, **without re-compressing** it. That's the
-  role our server plays. The alternative — the robot sending a separate stream to
-  each browser — would overload the robot.
 - **Encoding / codec (VP8)** — compressing video so it fits over the network.
   VP8 is the specific compression format; every browser can play it. The robot
   encodes once; nobody re-encodes after that.
 - **NAT / reachability** — most machines sit behind a router and don't have a
   directly-reachable public address. WebRTC has a built-in negotiation to find a
   working path between two peers. On a cloud server with a public address this is
-  easy; the deployment notes cover the one setting it needs.
-- **werift / aiortc / rclpy** — the libraries we use: `werift` is a WebRTC
-  implementation for the server (JavaScript), `aiortc` is one for the robot
-  (Python), and `rclpy` is the Python library for talking to ROS 2 (the robot's
-  software framework).
+  easy; the deployment notes cover the settings it needs.
+- **Client libraries** — `mediasoup-client` is the browser-side companion to
+  mediasoup; `pymediasoup` is the Python equivalent used on the robot (it drives
+  `aiortc`, a Python WebRTC implementation, under the hood); `rclpy` is the
+  Python library for talking to ROS 2 (the robot's software framework).
 
 ---
 
@@ -58,56 +75,48 @@ flowchart LR
     subgraph ROBOT["ROBOT — ROS 2"]
         TH["thruster_node"]
         CAM["synthetic_camera_node"]
-        STR["webrtc_streamer_node<br/>(the bridge)"]
+        STR["webrtc_streamer_node<br/>(the bridge, produces)"]
         TH -->|"/thrusters (100 Hz)"| STR
         CAM -->|"/camera/image_raw"| STR
     end
 
-    subgraph SERVER["SERVER — Next.js (cloud)"]
-        HUB["Hub / SFU<br/>receives robot • copies to each viewer"]
+    subgraph SERVER["SERVER — Next.js + mediasoup (cloud)"]
+        RTR["mediasoup Router<br/>1 video producer • 1 data producer<br/>N consumers per kind"]
     end
 
-    subgraph CLIENTS["BROWSERS"]
+    subgraph CLIENTS["BROWSERS (consume)"]
         V1["viewer 1<br/>&lt;video&gt; + thruster bars"]
         V2["viewer 2"]
         VN["viewer N"]
     end
 
-    STR <==>|"live video + thruster data"| HUB
-    HUB ==>|"copy of video + data"| V1
-    HUB ==> V2
-    HUB ==> VN
+    STR ==>|"live video + thruster data"| RTR
+    RTR ==>|"copy of video + data"| V1
+    RTR ==> V2
+    RTR ==> VN
 
-    STR -. "signaling (setup only)" .-> HUB
-    V1 -. "signaling (setup only)" .-> HUB
-    V2 -.-> HUB
-    VN -.-> HUB
+    STR -. "signaling /api/sfu" .-> RTR
+    V1 -. "signaling /api/sfu" .-> RTR
+    V2 -.-> RTR
+    VN -.-> RTR
 ```
 
-_Thick arrows = the live video and data. Dotted arrows = the short setup
-conversation that happens once, before the live connection opens._
+_Thick arrows = the live video and data. Dotted arrows = the signaling
+WebSocket, used for setup and for "a new stream appeared" notifications._
 
-Two design choices explain everything below:
+The design in one sentence: **the robot *produces* its streams into the server's
+router once, and every browser *consumes* only the streams it wants.**
 
-1. **The server is an SFU.** The robot sends one video stream to the server. The
-   server forwards copies to every browser. The robot never does more work as
-   more people watch.
-2. **The server always starts the connection.** For every peer (the robot and
-   each browser), the *server* sends the first "here's what I offer" message and
-   the other side replies. This matters because of the next point.
+Two properties fall out of this:
 
-### Why the server starts every connection
-
-The server's WebRTC library (`werift`) works reliably when it's the side that
-*initiates* the connection, but hits a bug when it's the side that *responds* —
-specifically when a video stream and a data channel share one connection, the
-connection's encryption step never completes and nothing flows. Making the server
-always initiate avoids the bug completely. (This was found the hard way; see the
-git history.)
-
-A direct consequence: **the server creates the data channels and declares the
-video slots.** The robot and browsers just receive whatever the server set up.
-More on this below.
+1. **The robot's work is constant.** It sends one video stream and one data
+   stream to the server, no matter how many people watch. The server's C++
+   worker makes the per-viewer copies without ever decompressing the video.
+2. **Browsers subscribe selectively.** A browser is told what producers exist
+   (`newProducer` / `newDataProducer` events, or a `getProducers` request when
+   joining late) and asks to consume only what its screen needs. Today's page
+   consumes the video and the `telemetry` data stream; a future dashboard page
+   could consume only telemetry, and the server would never send it video.
 
 ---
 
@@ -127,145 +136,140 @@ channels (ROS calls them *topics*), like any robot sensor would.
 
 ### The bridge — `webrtc_streamer_node`
 
-This is the program that turns robot data into a WebRTC stream. It:
+This is the program that turns robot data into WebRTC streams. It is a
+**mediasoup producer client** (`pymediasoup` + `aiortc`). It:
 
 - **Subscribes** to `/thrusters` and `/camera/image_raw` (listens to the two
   sources above).
-- Turns each camera frame into a **video track** and lets `aiortc` compress it
-  (VP8). To avoid lag, it only ever keeps the **newest** frame waiting to be
-  sent — if compression falls behind, old frames are dropped, not queued.
-- Turns each thruster reading into a small JSON message
-  `{"t": timestamp, "v": [v0, v1, v2, v3]}` and sends it on the **data channel**.
-- Acts as the **responder**: it connects to the server, waits for the server's
-  connection offer, attaches its video, and replies. (Remember: the server
-  always offers first.)
+- Connects to the server's signaling WebSocket (`/api/sfu`), loads the router's
+  capabilities, creates a **send transport**, and then:
+  - **produces video** — each camera frame becomes a frame on a video track,
+    compressed to VP8 by `aiortc`. To avoid lag, only the **newest** frame ever
+    waits to be sent — if compression falls behind, old frames are dropped, not
+    queued.
+  - **produces data** — each thruster reading becomes a small JSON message
+    `{"t": timestamp, "v": [v0, v1, v2, v3]}` on a data producer labelled
+    `telemetry`, created **unreliable** (unordered, no retransmits — newest
+    data wins).
 - **Auto-reconnects** every few seconds, so it survives the server restarting.
 
-One technical detail worth knowing: the robot library (`aiortc`) is asynchronous,
+One technical detail worth knowing: the robot's WebRTC stack is asynchronous,
 while ROS delivers data on a separate thread. The bridge safely hands data from
-the ROS thread over to the WebRTC side. Implementation:
+the ROS thread over to the WebRTC side (`loop.call_soon_threadsafe`).
+Implementation:
 `robot/ros2_ws/src/webrtc_streamer_pkg/.../webrtc_streamer_node.py`.
 
 ---
 
 ## Server — receiving and forwarding
 
-The server is a Next.js web app (`server/`). The forwarding logic is one file:
-`server/src/lib/webrtc/hub.ts` (the "Hub"). There's one shared Hub for the whole
-server process.
+The server is a Next.js web app (`server/`) with mediasoup embedded — mediasoup
+is a library, and its native `mediasoup-worker` process runs as a subprocess of
+the server. The server code is two files:
 
-### Who sets up what
+- `server/src/lib/mediasoup/sfu.ts` — owns the worker, the router, the shared
+  producer registry, and a `Peer` class (one per WebSocket connection) that
+  translates signaling messages into mediasoup calls.
+- `server/src/lib/mediasoup/config.ts` — worker/router/transport settings,
+  driven by environment variables (ports, public address, codec).
 
-Because the server initiates every connection, **the server is the one that
-creates the data channels and the video slots.** Concretely:
+There is **one worker and one router** — a single room. The router accepts VP8
+video only (matching the robot and every browser).
 
-- **For the robot's connection**, the server sets up:
-  - an *incoming* video slot (to receive the robot's camera), and
-  - a data channel named `telemetry` (unreliable — newest data wins).
-  The robot fills these in when it responds.
+### What the Node.js side actually does
 
-- **For each browser's connection**, the server sets up:
-  - an *outgoing* video slot (to send video to that browser), and
-  - its own `telemetry` data channel.
+Almost nothing per-packet. The signaling handler is a small request/response
+protocol (see below) whose handlers just call into mediasoup: create a
+transport, connect it, create a producer/consumer. After that, **all
+forwarding — video packets and data messages alike — happens inside the C++
+worker.** There is no application-level "loop over viewers and send" anywhere;
+creating a data consumer is enough, and the worker fans the messages out.
 
-So a browser doesn't create anything — it receives the server's video and the
-server's data channel, and just reads from them.
+Details that keep it smooth:
 
-### How the video forwarding actually works
+- Video is forwarded at the packet level, **never decompressed**. Each browser's
+  connection has its own encryption, so the worker re-seals each copy — that
+  re-encryption (not decoding) is the per-viewer cost.
+- New consumers start **paused** and the browser resumes them once its side is
+  wired up, so no early frames are lost. mediasoup handles requesting a fresh
+  keyframe from the robot so late joiners see a clean picture quickly.
+- Because the data streams are unreliable, a slow browser never causes a
+  backlog — it just misses a few updates and catches up with the next one.
 
-This is the core of the SFU, and it's simpler than it sounds:
+### Presence and health
 
-1. The robot's compressed video arrives at the server as a continuous stream of
-   small packets. The server does **not** decompress it or look inside it.
-2. The server holds **one object representing the robot's incoming video**.
-3. Each browser has an **outgoing video sender** on its own connection. The
-   server points every one of those senders at that **same** incoming robot
-   video object.
-4. From then on, whenever a video packet arrives from the robot, the library
-   copies it out to every browser's sender. Each browser's connection has its
-   own encryption, so each copy is re-sealed for that browser — but the video
-   itself is never decompressed or re-compressed. That's why it's cheap and
-   low-latency: **decode-free forwarding, one copy per viewer.**
-
-When a new browser joins mid-stream, the server asks the robot to send a fresh
-full frame (a "keyframe") so the new viewer sees a clean picture quickly instead
-of garbage.
-
-### How the data (thruster) forwarding works
-
-The data channels are **not** copied automatically — the server does it in code:
-
-1. The robot sends `{"t":…, "v":[…]}` on its `telemetry` channel.
-2. The server receives that message and **loops over every browser**, sending the
-   same text on each browser's `telemetry` channel.
-
-Because the channels are unreliable, a slow browser never causes a backlog — it
-just misses a few updates and catches up with the next one.
-
-### Robot present / absent
-
-- The server tracks whether the robot is connected. When a browser joins, the
-  server tells it the current state; when the robot disconnects, the server tells
-  all browsers `{"status":"offline"}` and stops feeding them the (now frozen)
-  video.
-- `GET /api/status` returns `{ "robot": true/false, "viewers": <count> }` for
-  quick health checks.
+- When the robot connects and produces, every browser gets `newProducer` /
+  `newDataProducer` events; when it disconnects, they get `producerClosed`.
+  The browser page uses these to show/hide its "Robot offline" overlay — there
+  is no separate presence message.
+- `GET /api/status` returns
+  `{ "ready": bool, "peers": n, "producers": n, "dataProducers": n }`
+  for quick health checks. `peers` counts every connected WebSocket (robot and
+  viewers alike); `producers: 1, dataProducers: 1` means the robot is live.
 
 ---
 
 ## Client — receiving and displaying
 
-The browser page is `server/src/app/page.tsx` (React + MUI).
+The browser page is `server/src/app/page.tsx` (React + MUI + `mediasoup-client`).
 
-### Connecting (the browser responds)
+### Connecting
 
-1. The browser opens the setup connection: `/api/signaling?role=viewer`.
-2. The server sends its offer; the browser accepts it and replies.
-3. The browser is handed a **video track** and a **data channel** (both created
-   by the server).
+1. Fetch `/api/ice-config` — the list of STUN/TURN helper servers (TURN only if
+   configured; see deployment).
+2. Open the signaling WebSocket `/api/sfu` and load a `mediasoup-client`
+   `Device` with the router's capabilities.
+3. Create a **receive transport** (one per browser; it carries everything).
+4. Ask `getProducers` for anything already streaming, and listen for
+   `newProducer` / `newDataProducer` events for anything that appears later.
+5. For the video producer: request `consume`, attach the resulting track,
+   then `resumeConsumer`. For the `telemetry` data producer: request
+   `consumeData` and read messages.
 
 ### Displaying
 
-- **Video** — the incoming video track is attached to a normal HTML `<video>`
+- **Video** — the consumed video track is attached to a normal HTML `<video>`
   element. The browser decompresses and plays it natively.
-- **Thruster numbers** — each data-channel message is parsed:
-  - `{"v":[…]}` → the four values are stored, and a screen-refresh loop
-    (~60 times a second) redraws four bars. This is deliberately **decoupled**
-    from the 100-per-second data rate, so the page redraws smoothly instead of
-    100 times a second. A live "Hz" readout shows the actual message rate.
-  - `{"status":"online"/"offline"}` → shows/hides a "Robot offline" overlay and
-    dims the video.
-
-The browser needs no special library — WebRTC is built in.
+- **Thruster numbers** — each `telemetry` message is parsed: the four values are
+  stored (messages with an older timestamp than the last one seen are ignored —
+  unreliable delivery can reorder), and a screen-refresh loop (~60 times a
+  second) redraws four bars. This is deliberately **decoupled** from the
+  100-per-second data rate, so the page redraws smoothly instead of 100 times a
+  second. A live "Hz" readout shows the actual message rate.
+- **Presence** — a `producerClosed` event dims the video and shows a
+  "Robot offline" overlay.
 
 ---
 
-## The setup conversation (signaling)
+## The signaling protocol
 
-Before any video flows, the two peers exchange two short messages over the
-WebSocket. The server always speaks first:
-
-```
-server → client   { "type": "offer",  "sdp": "…" }   (here's the connection I propose)
-client → server   { "type": "answer", "sdp": "…" }   (accepted, here's my side)
-```
-
-(`sdp` is just a text description of the connection — codecs and network
-addresses. We include all network addresses in that one message rather than
-trickling them in later, to keep the exchange to a single round-trip.)
-
-After those two messages, the live connection opens and the signaling WebSocket
-is no longer needed for media. Each such connection is direct between its two
-ends (robot↔server, and server↔browser) — but remember there are two of them, so
-robot data still reaches a browser via the server, not directly.
-
-The **actual robot/browser messages** (thruster values, status) travel on the
-data channel, *not* on this signaling connection:
+Everything on the `/api/sfu` WebSocket is JSON. Requests carry an `id` and an
+`action`; the server replies with the same `id` and `ok: true/false`. The server
+also pushes unsolicited **events** (no `id`).
 
 ```
-robot  → server → browsers   { "t": …, "v": [v0,v1,v2,v3] }   thruster values
-server → browsers            { "status": "online" | "offline" }  robot presence
-browser → server → robot     <command payload>                 (reserved; robot→ can receive commands)
+client → server   { "id": 1, "action": "getRtpCapabilities" }
+server → client   { "id": 1, "ok": true, "data": { …codecs… } }
+```
+
+| Action | Who uses it | What it does |
+|--------|-------------|--------------|
+| `getRtpCapabilities` | both | what codecs the router speaks |
+| `createTransport` | both | make my connection into the router |
+| `connectTransport` | both | finish that connection's encryption setup |
+| `produce` / `produceData` | robot | register my video / telemetry stream |
+| `getProducers` | browser | what's already streaming? (late join) |
+| `consume` / `consumeData` | browser | give me a copy of that stream |
+| `resumeConsumer` | browser | I'm wired up, start the video |
+
+Events pushed by the server: `newProducer`, `newDataProducer`,
+`producerClosed`, `dataProducerClosed`, `consumerClosed`.
+
+The **actual robot data** (thruster values) travels on the data stream, *not*
+on this signaling connection:
+
+```
+robot → router → browsers   { "t": …, "v": [v0,v1,v2,v3] }   thruster values, 100 Hz
 ```
 
 ---
@@ -275,7 +279,7 @@ browser → server → robot     <command payload>                 (reserved; ro
 ### Server (development)
 ```bash
 cd server
-npm install          # sets up the WebSocket support automatically
+npm install          # downloads the prebuilt mediasoup worker
 npm run dev          # http://localhost:3000
 ```
 
@@ -285,9 +289,12 @@ cd robot/ros2_ws
 colcon build --symlink-install
 source install/setup.bash
 ros2 launch robot_bringup sensors.launch.py     # the data sources
-ros2 launch robot_bringup webrtc.launch.py \
-  signaling_url:=ws://<server-host>:3000/api/signaling?role=robot
+ros2 launch robot_bringup webrtc.launch.py      # defaults to ws://localhost:3000/api/sfu
 ```
+
+To point the robot at another server:
+`ros2 launch robot_bringup webrtc.launch.py signaling_url:=ws://<host>:3000/api/sfu`
+— or use `webrtc_prod.launch.py`, which defaults to the deployed server.
 
 Then open the server's URL in one or more browsers.
 
@@ -295,27 +302,34 @@ Then open the server's URL in one or more browsers.
 
 ## Deployment (cloud)
 
-Deployed with Docker Compose. One extra thing to know: live video/data uses many
-short-lived network ports, and a container only exposes the ports you tell it to.
-So we (a) fix the range of ports WebRTC may use, (b) expose that range, and
-(c) tell the server its own public address so browsers know where to reach it.
+Deployed with Docker Compose using **host networking** — mediasoup's media ports
+must be directly reachable and advertise the real public IP, and Docker's NAT
+would get in the way. Full instructions live in [`deploy/README.md`](deploy/README.md);
+the short version:
 
 ```yaml
 services:
   gui:
     image: ghcr.io/emil1483/web-rtc-test:${TAG}
     restart: unless-stopped
+    network_mode: host
     environment:
-      - PUBLIC_IP=<server public address>    # so peers get a reachable address
-      - ICE_PORT_MIN=50000                    # range of ports WebRTC may use
-      - ICE_PORT_MAX=50019
-    ports:
-      - "0.0.0.0:3001:3000"                   # web page + setup conversation
-      - "50000-50019:50000-50019/udp"         # live video + data
+      - MEDIASOUP_ANNOUNCED_IP=<server public address>  # what peers connect to
+      - MEDIASOUP_LISTEN_IP=0.0.0.0
+      - MEDIASOUP_RTC_MIN_PORT=40000                     # media/data port range
+      - MEDIASOUP_RTC_MAX_PORT=40100
 ```
 
-Also open that port range in the host firewall. Because the server has a public
-address, no relay server is needed.
+Open in the firewall: **TCP** for the web app/signaling port, and
+**UDP + TCP 40000–40100** for the media. mediasoup also answers on **TCP** in
+that range (ICE-TCP), which gets clients on UDP-hostile networks (guest wifi,
+some mobile carriers) through without a relay server — so a TURN relay (coturn)
+is optional and off by default. If some client network still fails, enable the
+coturn service in `deploy/compose.yml` and set `TURN_URLS` / `TURN_USERNAME` /
+`TURN_CREDENTIAL`; browsers pick these up via `/api/ice-config`.
+
+One image caveat: mediasoup ships a prebuilt native worker for **glibc** Linux
+only, so the Docker image uses `node:22-bookworm-slim` (not Alpine).
 
 ---
 
@@ -323,16 +337,17 @@ address, no relay server is needed.
 
 One robot; the question is viewers. Limits, in the order you'd hit them:
 
-1. **Port range** — the connection setup uses one port per viewer. The range above
-   (20 ports) allows ~20 viewers. Widen the range (and the firewall) to raise it.
-2. **Server CPU** — the server's WebRTC library is single-threaded and re-seals
-   every video packet for every viewer. Realistic ceiling: a few **dozen**
-   viewers (more if the video is small/low-quality). This is the real limit.
-3. **Bandwidth** — the server sends one full video copy per viewer.
+1. **Port range** — each peer's transport uses one port from the RTC range. The
+   range above (~100 ports) allows ~100 peers. Widen the range (and the
+   firewall) to raise it.
+2. **Worker CPU** — one mediasoup worker uses one CPU core and comfortably
+   forwards a single video stream to **hundreds** of viewers (it's C++ and
+   never decodes). Past that, mediasoup scales by running one worker per core
+   and spreading viewers across them — a server-only change.
+3. **Bandwidth** — the server sends one full video copy per viewer. This is
+   usually the real ceiling: 100 viewers × 1 Mbit/s video = 100 Mbit/s upload.
 
-Past a few dozen viewers, the fix is to swap the server's forwarding engine for a
-purpose-built one (e.g. mediasoup or LiveKit — multi-core, made for this). The
-robot side wouldn't change.
+The robot side never changes: it always sends exactly one copy of everything.
 
 ---
 
@@ -346,11 +361,9 @@ robot side wouldn't change.
 Acronyms used here: **NAT** (address translation in a router), **CGNAT**
 (carrier-grade NAT — the carrier shares one public IP across many customers),
 **UDP/TCP** (connectionless / connection-oriented transports), **ICE** (WebRTC's
-path-finding), **STUN** (a peer discovering its own public address), **SDP** (the
-text describing a connection), **DTLS** (TLS over UDP — the encryption handshake),
-**RTP/SRTP** (real-time media packets / their encrypted form), **SCTP** (the
-transport under data channels), **BUNDLE + rtcp-mux** (put everything on one
-UDP port).
+path-finding), **STUN** (a peer discovering its own public address), **DTLS**
+(TLS over UDP — the encryption handshake), **RTP/SRTP** (real-time media packets
+/ their encrypted form), **SCTP** (the transport under data channels).
 
 ### Two legs, one middle
 
@@ -362,7 +375,9 @@ robot ──leg A── server (public IP) ──leg B── browser
 
 The key asymmetry: the robot (behind CGNAT) has **no inbound reachability**; the
 server **does**. So every leg is "a hidden peer reaching a public peer," which is
-the easy case — no TURN relay needed.
+the easy case — no TURN relay needed. mediasoup is an **ICE-lite** endpoint: it
+never initiates connectivity checks, it just answers them on its announced
+address, which is exactly right for a server that's always publicly reachable.
 
 ### Establishing one leg (robot ↔ server)
 
@@ -374,28 +389,27 @@ sequenceDiagram
 
     Note over R,S: 1. Signaling — over the WebSocket (TCP)
     R->>S: open WebSocket (outbound, always works)
-    S->>R: SDP offer (server candidates, DTLS fingerprint, ICE creds, codecs)
-    R->>S: SDP answer (robot host + srflx candidates, fingerprint, creds)
+    R->>S: createTransport
+    S->>R: transport params (server ICE candidates, DTLS fingerprint, ICE creds)
 
     Note over R,S: 2. ICE connectivity check — UDP
-    R->>N: STUN probe to server_public:50005
+    R->>N: STUN probe to server_public:4xxxx
     N->>S: rewritten src = carrier_public:PX (mapping created)
     S->>N: STUN reply to carrier_public:PX
     N->>R: forwarded back (hole punched)
 
     Note over R,S: 3. DTLS handshake — over the open UDP path
-    R->>S: certificates exchanged, fingerprints verified → shared keys
+    R->>S: connectTransport (fingerprints verified) → shared keys
 
     Note over R,S: 4. Media flows
-    R->>S: SRTP video + SCTP data, one UDP port (BUNDLE + rtcp-mux)
+    R->>S: SRTP video + SCTP data on the transport's port
 ```
 
-- **Signaling** carries candidates, the DTLS cert fingerprint, ICE credentials,
-  and codecs. Robot candidates: `host` (its CGNAT `10.x` — externally useless)
-  and `srflx` (its public mapping, learned via STUN). Server candidate: public
-  `IP:50005`.
+- The transport params carry the server's candidates (public `IP:port` from the
+  RTC range, both UDP and TCP), its DTLS cert fingerprint, and ICE credentials.
 - **ICE** works because the robot speaks first to the server's known public
-  address; the carrier NAT then permits the reply on that mapping.
+  address; the carrier NAT then permits the reply on that mapping. If UDP is
+  blocked entirely, the client falls back to the server's **TCP** candidate.
 - **DTLS** verifies each cert against the fingerprint from signaling (stops
   man-in-the-middle) and derives the media keys.
 - Leg B (server ↔ browser) is the identical procedure, independently, with its
@@ -405,30 +419,28 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    A["aiortc: VP8 → RTP → SRTP<br/>UDP src robot:p → dst server:50005"]
-    B["5G radio → gNodeB → UPF"]
-    C["Carrier NAT<br/>src → carrier_public:PX"]
+    A["aiortc: VP8 → RTP → SRTP<br/>UDP src robot:p → dst server:4xxxx"]
+    B["5G radio → carrier NAT<br/>src → carrier_public:PX"]
     D["Internet (BGP routing)"]
-    E["Linode host<br/>iptables DNAT :50005 → container"]
-    F["werift: SRTP decrypt (leg A)<br/>RTP payload, NOT decoded"]
-    G["werift: re-encrypt per viewer<br/>SRTP (leg B) → UDP dst browser:pY"]
+    E["host networking:<br/>packet lands directly on mediasoup worker"]
+    F["worker: SRTP decrypt (leg A)<br/>RTP payload, NOT decoded"]
+    G["worker: re-encrypt per viewer<br/>SRTP (leg B) → dst browser:pY"]
     H["Internet → browser NAT"]
     I["Browser: SRTP decrypt → jitter buffer<br/>→ VP8 decode → &lt;video&gt;"]
-    A --> B --> C --> D --> E --> F --> G --> H --> I
+    A --> B --> D --> E --> F --> G --> H --> I
 ```
 
-The server is the **encryption boundary**: it briefly holds the
+The server is the **encryption boundary**: the worker briefly holds the
 compressed-but-decrypted RTP in memory and re-seals a copy per viewer. It never
 decompresses the video — that per-viewer re-encryption (not decoding) is the CPU
-cost that caps viewer count. The thruster data channel follows the same UDP
-paths as SCTP instead of SRTP, forwarded in application code (a loop over
-viewers) rather than at the RTP layer.
+cost. The thruster data follows the same paths as SCTP instead of SRTP, also
+fanned out inside the worker.
 
 ### Details that keep it working
 - **NAT bindings expire** → continuous RTP plus periodic STUN keepalives hold
   both mappings open.
-- **One UDP port per connection** on the server (BUNDLE + rtcp-mux); robot and
-  browser each use one ephemeral UDP port.
+- **One port per transport** on the server; robot and browser each use one
+  ephemeral port.
 - **Two crypto domains** — a capture on leg A can't be decrypted with leg B keys;
   only the server holds both.
 - **Latency budget** — 5G radio (~10–30 ms) + carrier→internet + server
@@ -443,11 +455,14 @@ robot/ros2_ws/src/
   my_interfaces/          # Thrusters message (4 values + timestamp)
   thruster_pkg/           # thruster_node        → /thrusters (100 Hz)
   camera_pkg/             # synthetic_camera_node → /camera/image_raw
-  webrtc_streamer_pkg/    # webrtc_streamer_node  → the bridge (video + data)
-  robot_bringup/          # launch files
+  webrtc_streamer_pkg/    # webrtc_streamer_node  → the bridge (pymediasoup producer)
+  robot_bringup/          # launch files (webrtc.launch.py, webrtc_prod.launch.py)
 server/src/
-  app/api/signaling/route.ts   # the setup-conversation endpoint (robot & viewers)
+  app/api/sfu/route.ts         # signaling WebSocket endpoint (robot & viewers)
+  app/api/ice-config/route.ts  # STUN/TURN list for browsers
   app/api/status/route.ts      # health check
-  lib/webrtc/hub.ts            # the SFU: receive robot, forward to viewers
-  app/page.tsx                 # the browser page (video + thruster bars)
+  lib/mediasoup/sfu.ts         # worker/router + Peer signaling handlers
+  lib/mediasoup/config.ts      # env-driven mediasoup settings
+  app/page.tsx                 # the browser page (mediasoup-client: video + bars)
+deploy/                        # compose + deployment notes (see deploy/README.md)
 ```
