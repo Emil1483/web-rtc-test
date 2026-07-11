@@ -2,8 +2,9 @@
 
 Live streaming from a single robot to many web browsers with **low latency**.
 
-The robot sends a video feed and fast-updating numbers (thruster values, 100 times
-a second). A server in the cloud relays both to every browser that's watching.
+The robot sends a video feed, fast-updating numbers (thruster values, 100 times
+a second), and a live 3D point cloud. A server in the cloud relays all of it to
+every browser that's watching.
 The robot sends its data **once**; the server makes the copies. So one viewer or
 fifty, the robot's workload is the same.
 
@@ -42,18 +43,23 @@ You don't need a networking background. Here's every term used below, in one pla
   - **Consumer** — a copy of a producer that a peer receives *out of* the router
     (each browser's copy of the video).
   - **Data producer / data consumer** — the same idea for arbitrary messages
-    instead of video (the thruster numbers).
+    instead of video (the thruster numbers, the point clouds).
 - **Media track** — a live stream of video (or audio). Here: the robot's camera.
 - **Data channel** — a side pipe on the same connection for sending arbitrary
-  messages (here: the thruster numbers, as small chunks of JSON).
+  messages (here: the thruster numbers as small chunks of JSON, and the point
+  clouds as binary messages).
 - **Signaling** — the setup conversation a peer has with the server *before* the
   real connection opens (what codecs, what network addresses, "please give me a
   copy of the video"). We do this over a **WebSocket** (a normal always-open
   text connection) at `/api/sfu`.
 - **Reliable vs. unreliable delivery** — a data channel can guarantee every
   message arrives in order (like email), or it can favor speed and *drop* old
-  data if the network hiccups (like a live phone call). For 100 Hz values, stale
-  numbers are useless, so we choose **unreliable** — always get the newest.
+  data if the network hiccups (like a live phone call). We use both: the 100 Hz
+  thruster values are **unreliable** (stale numbers are useless — always get the
+  newest), while the point clouds are **reliable** — each cloud is big enough
+  to be split into many pieces on the wire, and unreliable delivery would lose
+  most of them. "Newest wins" for clouds is enforced on the robot instead (see
+  the bridge section).
 - **Encoding / codec (VP8)** — compressing video so it fits over the network.
   VP8 is the specific compression format; every browser can play it. The robot
   encodes once; nobody re-encodes after that.
@@ -75,24 +81,26 @@ flowchart LR
     subgraph ROBOT["ROBOT — ROS 2"]
         TH["thruster_node"]
         CAM["synthetic_camera_node"]
+        PC["pointcloud_node"]
         STR["webrtc_streamer_node<br/>(the bridge, produces)"]
         TH -->|"/thrusters (100 Hz)"| STR
         CAM -->|"/camera/image_raw"| STR
+        PC -->|"/pointcloud/points (40 Hz)"| STR
     end
 
     subgraph SERVER["SERVER — Next.js + mediasoup (cloud)"]
-        RTR["mediasoup Router<br/>1 video producer • 1 data producer<br/>N consumers per kind"]
+        RTR["mediasoup Router<br/>1 video producer • 2 data producers<br/>N consumers per kind"]
     end
 
     subgraph CLIENTS["BROWSERS (consume)"]
-        V1["viewer 1<br/>&lt;video&gt; + thruster bars"]
-        V2["viewer 2"]
+        V1["viewer on /<br/>&lt;video&gt; + thruster bars"]
+        V2["viewer on /pointcloud<br/>3D point cloud only"]
         VN["viewer N"]
     end
 
-    STR ==>|"live video + thruster data"| RTR
-    RTR ==>|"copy of video + data"| V1
-    RTR ==> V2
+    STR ==>|"video + telemetry + pointcloud"| RTR
+    RTR ==>|"video + telemetry"| V1
+    RTR ==>|"pointcloud only"| V2
     RTR ==> VN
 
     STR -. "signaling /api/sfu" .-> RTR
@@ -114,9 +122,10 @@ Two properties fall out of this:
    worker makes the per-viewer copies without ever decompressing the video.
 2. **Browsers subscribe selectively.** A browser is told what producers exist
    (`newProducer` / `newDataProducer` events, or a `getProducers` request when
-   joining late) and asks to consume only what its screen needs. Today's page
-   consumes the video and the `telemetry` data stream; a future dashboard page
-   could consume only telemetry, and the server would never send it video.
+   joining late) and asks to consume only what its screen needs. The main page
+   (`/`) consumes the video and the `telemetry` data stream; the `/pointcloud`
+   page consumes only the `pointcloud` data stream, and the server never sends
+   it video or telemetry.
 
 ---
 
@@ -130,17 +139,18 @@ The robot runs ROS 2 (its control software). Code: `robot/ros2_ws`.
 |---------|-----------|------------|------|
 | `thruster_node` | `/thrusters` | 4 thruster values (with a timestamp) | 100 per second |
 | `synthetic_camera_node` | `/camera/image_raw` | camera frames (a fake animated image; no real camera needed) | 30 per second |
+| `pointcloud_node` | `/pointcloud/points` | an animated 3D point cloud (~2,900 points: a rippling wave surface plus a spinning helix; no real sensor needed) | 40 per second |
 
-These two know nothing about the web or WebRTC. They just publish data on named
-channels (ROS calls them *topics*), like any robot sensor would.
+These three know nothing about the web or WebRTC. They just publish data on
+named channels (ROS calls them *topics*), like any robot sensor would.
 
 ### The bridge — `webrtc_streamer_node`
 
 This is the program that turns robot data into WebRTC streams. It is a
 **mediasoup producer client** (`pymediasoup` + `aiortc`). It:
 
-- **Subscribes** to `/thrusters` and `/camera/image_raw` (listens to the two
-  sources above).
+- **Subscribes** to `/thrusters`, `/camera/image_raw`, and `/pointcloud/points`
+  (listens to the three sources above).
 - Connects to the server's signaling WebSocket (`/api/sfu`), loads the router's
   capabilities, creates a **send transport**, and then:
   - **produces video** — each camera frame becomes a frame on a video track,
@@ -151,6 +161,14 @@ This is the program that turns robot data into WebRTC streams. It is a
     `{"t": timestamp, "v": [v0, v1, v2, v3]}` on a data producer labelled
     `telemetry`, created **unreliable** (unordered, no retransmits — newest
     data wins).
+  - **produces a second data stream** — each point cloud becomes one binary
+    message (an 8-byte timestamp followed by the points as raw `float32`
+    x,y,z) on a data producer labelled `pointcloud`. Unlike telemetry, this
+    one is **reliable and ordered**: a cloud (~35 KB) gets split into many
+    pieces on the wire, and unreliable delivery would lose most clouds
+    entirely. "Newest wins" is enforced on the robot instead — if the channel
+    is still busy sending an earlier cloud, the new one is dropped, not
+    queued, so a slow network can never build up lag.
 - **Auto-reconnects** every few seconds, so it survives the server restarting.
 
 One technical detail worth knowing: the robot's WebRTC stack is asynchronous,
@@ -205,15 +223,23 @@ Details that keep it smooth:
 - `GET /api/status` returns
   `{ "ready": bool, "peers": n, "producers": n, "dataProducers": n }`
   for quick health checks. `peers` counts every connected WebSocket (robot and
-  viewers alike); `producers: 1, dataProducers: 1` means the robot is live.
+  viewers alike); `producers: 1, dataProducers: 2` means the robot is live
+  (one video, plus the `telemetry` and `pointcloud` data streams).
 
 ---
 
 ## Client — receiving and displaying
 
-The browser page is `server/src/app/page.tsx` (React + MUI + `mediasoup-client`).
+There are two browser pages (React + MUI + `mediasoup-client`), which share the
+connection helpers in `server/src/lib/sfuClient.ts`:
 
-### Connecting
+- **`/`** (`app/page.tsx`) — the main viewer: video + thruster bars.
+- **`/pointcloud`** (`app/pointcloud/page.tsx`) — a 3D point-cloud view. It
+  consumes *only* the `pointcloud` data stream — no video, no telemetry —
+  selective subscription in action: the server never sends this page the
+  streams it doesn't ask for.
+
+### Connecting (shared code in `sfuClient.ts`)
 
 1. Fetch `/api/ice-config` — the list of STUN/TURN helper servers (TURN only if
    configured; see deployment).
@@ -222,9 +248,10 @@ The browser page is `server/src/app/page.tsx` (React + MUI + `mediasoup-client`)
 3. Create a **receive transport** (one per browser; it carries everything).
 4. Ask `getProducers` for anything already streaming, and listen for
    `newProducer` / `newDataProducer` events for anything that appears later.
-5. For the video producer: request `consume`, attach the resulting track,
-   then `resumeConsumer`. For the `telemetry` data producer: request
-   `consumeData` and read messages.
+5. For each producer the page wants (it picks by the producer's label —
+   `telemetry` or `pointcloud`): video → request `consume`, attach the
+   resulting track, then `resumeConsumer`; data → request `consumeData` and
+   read messages.
 
 ### Displaying
 
@@ -236,7 +263,13 @@ The browser page is `server/src/app/page.tsx` (React + MUI + `mediasoup-client`)
   second) redraws four bars. This is deliberately **decoupled** from the
   100-per-second data rate, so the page redraws smoothly instead of 100 times a
   second. A live "Hz" readout shows the actual message rate.
-- **Presence** — a `producerClosed` event dims the video and shows a
+- **Point cloud** (`/pointcloud`) — each binary message is unpacked (the
+  timestamp, then the `float32` x,y,z points; clouds older than the last one
+  shown are dropped) and drawn on a plain 2D `<canvas>` with a small
+  hand-rolled perspective projection — no 3D library. Drag to orbit, scroll to
+  zoom; points are colored by height. Like the bars, drawing runs at
+  screen-refresh rate, decoupled from the 40 Hz arrival rate.
+- **Presence** — a `producerClosed` event dims the view and shows a
   "Robot offline" overlay.
 
 ---
@@ -265,11 +298,12 @@ server → client   { "id": 1, "ok": true, "data": { …codecs… } }
 Events pushed by the server: `newProducer`, `newDataProducer`,
 `producerClosed`, `dataProducerClosed`, `consumerClosed`.
 
-The **actual robot data** (thruster values) travels on the data stream, *not*
-on this signaling connection:
+The **actual robot data** travels on the data streams, *not* on this signaling
+connection:
 
 ```
-robot → router → browsers   { "t": …, "v": [v0,v1,v2,v3] }   thruster values, 100 Hz
+robot → router → browsers   { "t": …, "v": [v0,v1,v2,v3] }        telemetry (JSON), 100 Hz
+robot → router → browsers   [f64 timestamp][f32 x,y,z × points]   pointcloud (binary), 40 Hz
 ```
 
 ---
@@ -296,7 +330,8 @@ To point the robot at another server:
 `ros2 launch robot_bringup webrtc.launch.py signaling_url:=ws://<host>:3000/api/sfu`
 — or use `webrtc_prod.launch.py`, which defaults to the deployed server.
 
-Then open the server's URL in one or more browsers.
+Then open the server's URL in one or more browsers — the main page at `/`,
+the point-cloud view at `/pointcloud`.
 
 ---
 
@@ -455,6 +490,7 @@ robot/ros2_ws/src/
   my_interfaces/          # Thrusters message (4 values + timestamp)
   thruster_pkg/           # thruster_node        → /thrusters (100 Hz)
   camera_pkg/             # synthetic_camera_node → /camera/image_raw
+  pointcloud_pkg/         # pointcloud_node      → /pointcloud/points (40 Hz)
   webrtc_streamer_pkg/    # webrtc_streamer_node  → the bridge (pymediasoup producer)
   robot_bringup/          # launch files (webrtc.launch.py, webrtc_prod.launch.py)
 server/src/
@@ -463,6 +499,8 @@ server/src/
   app/api/status/route.ts      # health check
   lib/mediasoup/sfu.ts         # worker/router + Peer signaling handlers
   lib/mediasoup/config.ts      # env-driven mediasoup settings
-  app/page.tsx                 # the browser page (mediasoup-client: video + bars)
+  lib/sfuClient.ts             # shared browser helpers (signaling RPC, connect, consume)
+  app/page.tsx                 # main page (video + thruster bars)
+  app/pointcloud/page.tsx      # 3D point-cloud page (consumes only "pointcloud")
 deploy/                        # compose + deployment notes (see deploy/README.md)
 ```

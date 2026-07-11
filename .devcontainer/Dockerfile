@@ -21,7 +21,19 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 ENV POETRY_VIRTUALENVS_IN_PROJECT=true
 ENV POETRY_VIRTUALENVS_OPTIONS_SYSTEM_SITE_PACKAGES=true
 
-# Source ROS2 on every bash session
-RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc
-RUN echo "source /repo_root/robot/ros2_ws/install/setup.bash 2>/dev/null || true" >> /root/.bashrc
-RUN echo "export PYTHONPATH=\$PYTHONPATH:/repo_root/robot/ros2_ws/.venv/lib/python3.10/site-packages" >> /root/.bashrc
+# Non-root user matching the host user, so files created in the bind mount
+# aren't root-owned on the host. VS Code remaps the UID/GID to the local
+# user's on container create (updateRemoteUserUID, on by default).
+ARG USERNAME=dev
+RUN useradd -m -s /bin/bash -u 1000 $USERNAME \
+    && apt-get update && apt-get install -y sudo \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
+    && chmod 0440 /etc/sudoers.d/$USERNAME
+
+# Source ROS2 on every bash session (root and dev)
+RUN for rc in /root/.bashrc /home/$USERNAME/.bashrc; do \
+      echo "source /opt/ros/humble/setup.bash" >> $rc; \
+      echo "source /repo_root/robot/ros2_ws/install/setup.bash 2>/dev/null || true" >> $rc; \
+      echo "export PYTHONPATH=\$PYTHONPATH:/repo_root/robot/ros2_ws/.venv/lib/python3.10/site-packages" >> $rc; \
+    done

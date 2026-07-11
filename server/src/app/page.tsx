@@ -1,14 +1,22 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Device } from "mediasoup-client";
-import type { types } from "mediasoup-client";
+import NextLink from "next/link";
 import Box from "@mui/material/Box";
+import Button from "@mui/material/Button";
 import Chip from "@mui/material/Chip";
 import Container from "@mui/material/Container";
 import Paper from "@mui/material/Paper";
 import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
+
+import {
+  connectToSfu,
+  consumeData,
+  consumeVideo,
+  type ProducerList,
+  type SfuConnection,
+} from "@/lib/sfuClient";
 
 const THRUSTER_COLORS = ["#42a5f5", "#66bb6a", "#ffa726", "#ef5350"];
 
@@ -58,51 +66,6 @@ function ThrusterBar({ index, value }: { index: number; value: number }) {
   );
 }
 
-// Minimal request/response over the signaling WebSocket, correlated by id.
-class Signaling {
-  private ws: WebSocket;
-  private nextId = 1;
-  private pending = new Map<
-    number,
-    { resolve: (v: unknown) => void; reject: (e: Error) => void }
-  >();
-  onEvent: (msg: Record<string, unknown>) => void = () => {};
-
-  constructor(url: string) {
-    this.ws = new WebSocket(url);
-    this.ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      if (typeof msg.id === "number" && this.pending.has(msg.id)) {
-        const p = this.pending.get(msg.id)!;
-        this.pending.delete(msg.id);
-        if (msg.ok) p.resolve(msg.data);
-        else p.reject(new Error(msg.error ?? "rpc error"));
-      } else if (msg.event) {
-        this.onEvent(msg);
-      }
-    };
-  }
-
-  ready(): Promise<void> {
-    return new Promise((res, rej) => {
-      this.ws.onopen = () => res();
-      this.ws.onerror = () => rej(new Error("ws error"));
-    });
-  }
-
-  request<T = unknown>(action: string, params: object = {}): Promise<T> {
-    const id = this.nextId++;
-    return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
-      this.ws.send(JSON.stringify({ id, action, ...params }));
-    });
-  }
-
-  close() {
-    this.ws.close();
-  }
-}
-
 export default function Home() {
   const [state, setState] = useState<string>("new");
   const [values, setValues] = useState<number[]>([0, 0, 0, 0]);
@@ -116,8 +79,7 @@ export default function Home() {
 
   useEffect(() => {
     let cancelled = false;
-    let signaling: Signaling | null = null;
-    let recvTransport: types.Transport | null = null;
+    let conn: SfuConnection | null = null;
 
     const handleTelemetry = (raw: string) => {
       try {
@@ -134,86 +96,29 @@ export default function Home() {
       }
     };
 
-    const consumeVideo = async (producerId: string, device: Device) => {
-      if (!recvTransport) return;
-      const p = await signaling!.request<{
-        id: string;
-        producerId: string;
-        kind: types.MediaKind;
-        rtpParameters: types.RtpParameters;
-      }>("consume", {
-        transportId: recvTransport.id,
-        producerId,
-        rtpCapabilities: device.rtpCapabilities,
-      });
-      const consumer = await recvTransport.consume(p);
+    const onVideo = async (producerId: string) => {
+      const consumer = await consumeVideo(conn!, producerId);
       if (videoRef.current) {
         videoRef.current.srcObject = new MediaStream([consumer.track]);
       }
-      await signaling!.request("resumeConsumer", { consumerId: consumer.id });
       setRobotOnline(true);
     };
 
-    const consumeData = async (dataProducerId: string) => {
-      if (!recvTransport) return;
-      const p = await signaling!.request<{
-        id: string;
-        dataProducerId: string;
-        sctpStreamParameters: types.SctpStreamParameters;
-        label: string;
-        protocol: string;
-      }>("consumeData", { transportId: recvTransport.id, dataProducerId });
-      const dc = await recvTransport.consumeData(p);
+    const onTelemetry = async (dataProducerId: string) => {
+      const dc = await consumeData(conn!, dataProducerId);
       dc.on("message", (data: string) => handleTelemetry(data));
     };
 
     (async () => {
-      // ICE servers (STUN + optional TURN) for the transport.
-      let iceServers: RTCIceServer[] = [];
-      try {
-        const res = await fetch("/api/ice-config");
-        const cfg = await res.json();
-        if (Array.isArray(cfg.iceServers)) iceServers = cfg.iceServers;
-      } catch {
-        /* direct only */
-      }
-
-      const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      signaling = new Signaling(`${proto}://${window.location.host}/api/sfu`);
-      await signaling.ready();
+      conn = await connectToSfu(setState);
       if (cancelled) return;
 
-      const device = new Device();
-      const routerRtpCapabilities = await signaling.request<types.RtpCapabilities>(
-        "getRtpCapabilities",
-      );
-      await device.load({ routerRtpCapabilities });
-
-      // Create the receive transport.
-      const params = await signaling.request<types.TransportOptions>(
-        "createTransport",
-        { direction: "recv" },
-      );
-      recvTransport = device.createRecvTransport({ ...params, iceServers });
-
-      recvTransport.on("connect", ({ dtlsParameters }, cb, errback) => {
-        signaling!
-          .request("connectTransport", {
-            transportId: recvTransport!.id,
-            dtlsParameters,
-          })
-          .then(() => cb())
-          .catch(errback);
-      });
-      recvTransport.on("connectionstatechange", (s) => setState(s));
-
-      // Server pushes availability events; consume what each screen needs.
-      signaling.onEvent = (msg) => {
+      // Server pushes availability events; consume what this screen needs.
+      conn.signaling.onEvent = (msg) => {
         if (msg.event === "newProducer" && msg.kind === "video") {
-          void consumeVideo(msg.producerId as string, device);
+          void onVideo(msg.producerId as string);
         } else if (msg.event === "newDataProducer") {
-          // This screen wants telemetry; other screens would filter on label.
-          if (msg.label === "telemetry") void consumeData(msg.dataProducerId as string);
+          if (msg.label === "telemetry") void onTelemetry(msg.dataProducerId as string);
         } else if (msg.event === "producerClosed") {
           setRobotOnline(false);
           lastT.current = -Infinity;
@@ -222,15 +127,12 @@ export default function Home() {
       };
 
       // Consume anything already being produced (robot connected first).
-      const existing = await signaling.request<{
-        producers: { producerId: string; kind: string }[];
-        dataProducers: { dataProducerId: string; label: string }[];
-      }>("getProducers");
+      const existing = await conn.signaling.request<ProducerList>("getProducers");
       for (const pr of existing.producers) {
-        if (pr.kind === "video") await consumeVideo(pr.producerId, device);
+        if (pr.kind === "video") await onVideo(pr.producerId);
       }
       for (const dp of existing.dataProducers) {
-        if (dp.label === "telemetry") await consumeData(dp.dataProducerId);
+        if (dp.label === "telemetry") await onTelemetry(dp.dataProducerId);
       }
     })().catch((err) => console.error("[sfu] setup failed:", err));
 
@@ -248,8 +150,8 @@ export default function Home() {
     return () => {
       cancelled = true;
       cancelAnimationFrame(raf);
-      recvTransport?.close();
-      signaling?.close();
+      conn?.recvTransport.close();
+      conn?.signaling.close();
     };
   }, []);
 
@@ -267,7 +169,12 @@ export default function Home() {
           sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}
         >
           <Typography variant="h4">Robot Telemetry</Typography>
-          <Chip label={`WebRTC: ${state}`} color={color} size="small" />
+          <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
+            <Button component={NextLink} href="/pointcloud" size="small">
+              Pointcloud
+            </Button>
+            <Chip label={`WebRTC: ${state}`} color={color} size="small" />
+          </Stack>
         </Box>
 
         <Paper

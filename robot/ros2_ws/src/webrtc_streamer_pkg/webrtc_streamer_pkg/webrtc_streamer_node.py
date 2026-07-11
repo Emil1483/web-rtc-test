@@ -3,8 +3,16 @@
 The robot side of the SFU. Connects to the mediasoup signaling endpoint and
 *produces*:
 
-  * /camera/image_raw (sensor_msgs/Image, rgb8) -> a VP8 video track
-  * /thrusters        (my_interfaces/Thrusters)  -> a data producer (unreliable)
+  * /camera/image_raw  (sensor_msgs/Image, rgb8)     -> a VP8 video track
+  * /thrusters         (my_interfaces/Thrusters)     -> data producer "telemetry" (unreliable)
+  * /pointcloud/points (sensor_msgs/PointCloud2)     -> data producer "pointcloud" (reliable)
+
+Point clouds go as binary: 8-byte little-endian float64 timestamp, then the
+PointCloud2 payload verbatim (packed float32 x,y,z per point — the layout
+pointcloud_node publishes). The channel is reliable+ordered because a cloud
+fragments into many SCTP chunks and unreliable delivery loses most of them;
+newest-wins is enforced sender-side by dropping clouds while the channel
+still buffers earlier ones.
 
 Browsers consume these selectively via the server. rclpy runs in a background
 thread; pymediasoup/aiortc run on an asyncio loop in the main thread. ROS
@@ -15,6 +23,7 @@ import asyncio
 import fractions
 import json
 import os
+import struct
 import threading
 import time
 
@@ -36,7 +45,7 @@ from pymediasoup.models.transport import (
 )
 from pymediasoup.sctp_parameters import SctpParameters
 
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, PointCloud2
 from my_interfaces.msg import Thrusters
 
 DEFAULT_SIGNALING_URL = "ws://localhost:3000/api/sfu"
@@ -91,6 +100,7 @@ class WebRtcStreamerNode(Node):
 
         self.video_track: RosVideoTrack | None = None
         self.data_producer = None
+        self.pointcloud_producer = None
 
         # Signaling RPC state (per connection).
         self._ws = None
@@ -99,6 +109,11 @@ class WebRtcStreamerNode(Node):
 
         self.create_subscription(Image, "camera/image_raw", self.on_image, 10)
         self.create_subscription(Thrusters, "thrusters", self.on_thrusters, 10)
+        # depth 1: clouds are big and only the newest matters
+        self.create_subscription(
+            PointCloud2, "pointcloud/points", self.on_pointcloud, 1
+        )
+        self._warned_pointcloud_layout = False
         self.get_logger().info(
             f"WebRtcStreamerNode started, signaling: {self.signaling_url}"
         )
@@ -124,6 +139,31 @@ class WebRtcStreamerNode(Node):
         dp = self.data_producer
         if dp is not None and dp.readyState == "open":
             dp.send(payload)
+
+    def on_pointcloud(self, msg: PointCloud2):
+        # The streamer forwards msg.data verbatim, so it requires the packed
+        # float32 x,y,z layout pointcloud_node publishes.
+        if msg.point_step != 12 or msg.is_bigendian:
+            if not self._warned_pointcloud_layout:
+                self._warned_pointcloud_layout = True
+                self.get_logger().warn(
+                    "pointcloud dropped: expected packed little-endian float32 "
+                    f"x,y,z (point_step 12), got point_step {msg.point_step}"
+                )
+            return
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        payload = struct.pack("<d", stamp) + bytes(msg.data)
+        self.loop.call_soon_threadsafe(self._send_pointcloud, payload)
+
+    def _send_pointcloud(self, payload: bytes):
+        dp = self.pointcloud_producer
+        if dp is None or dp.readyState != "open":
+            return
+        # Newest wins: if the channel still buffers earlier clouds, drop this
+        # one instead of queueing lag.
+        if dp.bufferedAmount > 2 * len(payload):
+            return
+        dp.send(payload)
 
     # --- signaling RPC ----------------------------------------------------
 
@@ -234,12 +274,20 @@ class WebRtcStreamerNode(Node):
                 self.data_producer = await transport.produceData(
                     ordered=False, maxRetransmits=0, label="telemetry"
                 )
-                self.get_logger().info("producing video + telemetry")
+                # Ordered + reliable, unlike telemetry: a cloud fragments into
+                # ~30 SCTP chunks, and unreliable (or even unordered) delivery
+                # of fragmented messages loses ~90% of them end-to-end.
+                # Newest-wins is enforced in _send_pointcloud instead.
+                self.pointcloud_producer = await transport.produceData(
+                    label="pointcloud"
+                )
+                self.get_logger().info("producing video + telemetry + pointcloud")
 
                 await reader_task  # returns when the socket closes
             finally:
                 reader_task.cancel()
                 self.data_producer = None
+                self.pointcloud_producer = None
                 self.video_track = None
                 self._ws = None
                 if transport is not None:

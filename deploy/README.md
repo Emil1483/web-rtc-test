@@ -41,14 +41,10 @@ traverses most UDP-hostile networks (5G CGNAT, guest wifi) without a relay. Keep
 coturn only if real clients still fail; then uncomment it in `compose.yml` and
 set `TURN_*` env so clients receive relay candidates via `/api/ice-config`.
 
-## Remaining work (client migration)
-The **server** speaks mediasoup. The **robot** and **browser** still use the old
-werift path (`/api/signaling`) and must be migrated to the mediasoup signaling
-(`/api/sfu`) with a mediasoup client:
-- **Browser** — `mediasoup-client` (`Device.load`, create recv transport,
-  `consume` only the producers each screen needs).
-- **Robot** — a mediasoup producer client. Python options: `pymediasoup`
-  (community) or an ffmpeg/gstreamer → mediasoup `PlainTransport` bridge. The
-  current aiortc node does **not** speak mediasoup natively.
-
-Until then, keep the werift route deployed alongside for the working demo.
+## Clients
+Both clients speak mediasoup over `/api/sfu` (the old werift `/api/signaling`
+route is gone):
+- **Browser** — `mediasoup-client` (`Device.load`, recv transport, consumes
+  only the producers each screen needs).
+- **Robot** — `pymediasoup` + aiortc producer (`webrtc_streamer_node`); use
+  `webrtc_prod.launch.py` to point it at this deployment.

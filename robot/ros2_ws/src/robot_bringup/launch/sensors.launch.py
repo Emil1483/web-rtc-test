@@ -17,5 +17,11 @@ def generate_launch_description():
                 respawn=True,
                 respawn_delay=2.0,
             ),
+            Node(
+                package="pointcloud_pkg",
+                executable="pointcloud_node",
+                respawn=True,
+                respawn_delay=2.0,
+            ),
         ]
     )

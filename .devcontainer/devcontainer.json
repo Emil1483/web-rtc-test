@@ -5,9 +5,10 @@
   },
   "workspaceMount": "source=${localWorkspaceFolder},target=/repo_root,type=bind",
   "mounts": [
-    "source=${localEnv:HOME}/.gitconfig,target=/root/.gitconfig,type=bind,consistency=cached,readonly",
+    "source=${localEnv:HOME}/.gitconfig,target=/home/dev/.gitconfig,type=bind,consistency=cached,readonly",
     "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind"
   ],
+  "remoteUser": "dev",
   "runArgs": [
     "--network=host",
     "--env=DISPLAY=${localEnv:DISPLAY}",
